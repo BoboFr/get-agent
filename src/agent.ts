@@ -41,7 +41,7 @@ export class Agent {
       name: config.name,
       systemPrompt: config.systemPrompt || "You are a helpful AI assistant.",
       model: config.model || "",
-      baseUrl: config.baseUrl || "http://srv-ia-01.incb.local:8080/v1",
+      baseUrl: config.baseUrl || "http://127.0.0.1:8080/v1",
       apiKey: config.apiKey || "no-key",
       tools: config.tools || [],
       mcpServers: config.mcpServers || [],
