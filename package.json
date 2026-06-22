@@ -1,6 +1,6 @@
 {
   "name": "@thegetget/get-agent",
-  "version": "1.0.7",
+  "version": "1.0.6",
   "description": "A lightweight AI Agent framework in TypeScript with Zod validation, tool calling, and MCP support.",
   "type": "module",
   "main": "./dist/index.js",
