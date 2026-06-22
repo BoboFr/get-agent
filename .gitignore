@@ -1,0 +1,17 @@
+# Dépendances
+node_modules/
+
+# Sortie de build
+dist/
+
+# Artefacts npm pack
+*.tgz
+
+# Fichiers .js compilés dans les sources (la sortie va dans dist/)
+src/**/*.js
+examples/**/*.js
+
+# Divers
+.agent-history/
+*.log
+.env
