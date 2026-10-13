@@ -31,6 +31,7 @@ npx tsx examples/01_chat_et_sortie_structuree.ts
 | 14 | [14_multimodal.ts](14_multimodal.ts) | Images et documents en entrée (`userMessage`, `imageFromFile`, `fileFromPath`) |
 | 15 | [15_workflow_avance.ts](15_workflow_avance.ts) | Workflow avancé : étape parallèle, retry/timeout, mode strict, trace, checkpoint et reprise |
 | 16 | [16_agent_skills.ts](16_agent_skills.ts) | Agent Skills (`SKILL.md`) chargées à la demande, avec les skills d'exemple de [`skills/`](skills) |
+| 17 | [17_guardrails.ts](17_guardrails.ts) | Guardrails : injection de prompt (entrée et résultats d'outils), PII, `llmGuardrail`, `parallelInput`, streaming en mode `buffer` |
 
 Certains exemples acceptent un argument :
 

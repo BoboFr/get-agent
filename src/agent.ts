@@ -8,7 +8,8 @@ import type { AgentSkill } from "./agent-skill.js";
 import { Logger } from "./logger.js";
 import type { LoggerConfig } from "./logger.js";
 import type { HistoryAdapter } from "./history.js";
-import type { Guardrails, GuardrailFn } from "./guardrails.js";
+import { applyGuardrails, GuardrailError } from "./guardrails.js";
+import type { Guardrails, GuardrailContext, GuardrailStage } from "./guardrails.js";
 import { StreamTagParser } from "./stream-parser.js";
 import {
   extractToolCalls,
@@ -336,7 +337,23 @@ export class Agent {
     structuredConfig: StructuredOutputConfig<T> | undefined,
     signal: AbortSignal | undefined
   ): Promise<z.infer<T> | string> {
-    const { isLfm } = await this.prepareTurn(input);
+    await this.initialize();
+    // A blocked turn leaves no trace in the history.
+    const historyBefore = [...this.messageHistory];
+    try {
+      return await this.runTurn(input, structuredConfig, signal);
+    } catch (err) {
+      if (err instanceof GuardrailError) this.messageHistory = historyBefore;
+      throw err;
+    }
+  }
+
+  private async runTurn<T extends z.ZodType>(
+    input: string | Message[],
+    structuredConfig: StructuredOutputConfig<T> | undefined,
+    signal: AbortSignal | undefined
+  ): Promise<z.infer<T> | string> {
+    let { isLfm, pendingInputCheck } = await this.prepareTurn(input, signal);
 
     // The schema instructions only depend on the schema, so build them once per run.
     const promptSchemaInstructions = structuredConfig
@@ -346,31 +363,41 @@ export class Agent {
     for (let iteration = 1; iteration <= this.config.maxIterations; iteration++) {
       this.log(`--- Iteration ${iteration} ---`);
 
-      // Temporarily append schema instructions to the last user/tool message so the
-      // LLM keeps them in immediate context. Multimodal bodies (content arrays) get
-      // the instructions as an extra text part instead of string concatenation.
-      const activeMessages = [...this.messageHistory];
-      const lastMessage = activeMessages[activeMessages.length - 1];
-      if (promptSchemaInstructions && lastMessage && (lastMessage.role === "user" || lastMessage.role === "tool")) {
-        activeMessages[activeMessages.length - 1] = {
-          ...lastMessage,
-          content: Array.isArray(lastMessage.content)
-            ? [...lastMessage.content, { type: "text" as const, text: promptSchemaInstructions }]
-            : (lastMessage.content || "") + promptSchemaInstructions,
-        };
-      }
-
       const toolsPayload = this.getToolsPayload();
-      this.log(`Calling LLM (${this.config.model})...`);
-      const response = await this.llmClient.chatCompletion({
-        model: this.config.model,
-        messages: await this.prepareRequestMessages(activeMessages),
-        tools: toolsPayload.length > 0 ? toolsPayload : undefined,
-        // Use JSON Object response format constraint if the LLM backend supports it
-        response_format: structuredConfig ? { type: "json_object" } : undefined,
-        temperature: this.config.temperature,
-        signal,
-      });
+      const call = async (callSignal: AbortSignal | undefined): Promise<any> => {
+        // Temporarily append schema instructions to the last user/tool message so the
+        // LLM keeps them in immediate context. Multimodal bodies (content arrays) get
+        // the instructions as an extra text part instead of string concatenation.
+        const activeMessages = [...this.messageHistory];
+        const lastMessage = activeMessages[activeMessages.length - 1];
+        if (promptSchemaInstructions && lastMessage && (lastMessage.role === "user" || lastMessage.role === "tool")) {
+          activeMessages[activeMessages.length - 1] = {
+            ...lastMessage,
+            content: Array.isArray(lastMessage.content)
+              ? [...lastMessage.content, { type: "text" as const, text: promptSchemaInstructions }]
+              : (lastMessage.content || "") + promptSchemaInstructions,
+          };
+        }
+        this.log(`Calling LLM (${this.config.model})...`);
+        return this.llmClient.chatCompletion({
+          model: this.config.model,
+          messages: await this.prepareRequestMessages(activeMessages),
+          tools: toolsPayload.length > 0 ? toolsPayload : undefined,
+          // Use JSON Object response format constraint if the LLM backend supports it
+          response_format: structuredConfig ? { type: "json_object" } : undefined,
+          temperature: this.config.temperature,
+          signal: callSignal,
+        });
+      };
+
+      let response: any;
+      if (pendingInputCheck) {
+        const check = pendingInputCheck;
+        pendingInputCheck = null;
+        response = await this.callWithParallelInputCheck(check, call, signal);
+      } else {
+        response = await call(signal);
+      }
       this.recordUsage(response.usage);
 
       const choice = response.choices?.[0];
@@ -401,7 +428,7 @@ export class Agent {
       this.messageHistory.push(assistantMessage);
 
       if (toolCalls && toolCalls.length > 0) {
-        await this.handleToolCalls(toolCalls);
+        await this.handleToolCalls(toolCalls, signal);
         continue;
       }
 
@@ -411,17 +438,15 @@ export class Agent {
         const data = validationResult.success
           ? validationResult.data
           : await this.retryStructuredOutputCorrection(structuredConfig, validationResult.error, signal);
+        const guarded = await this.guardStructuredOutput(data, structuredConfig.schema, signal);
         await this.saveHistory();
-        return data;
+        return guarded;
       }
 
-      let finalText = this.config.showThinking
-        ? (typeof content === "string" ? content : "")
-        : (cleanContentWithoutTools || "");
-
-      if (this.config.guardrails?.output?.length) {
-        finalText = await this.runGuardrails(finalText, this.config.guardrails.output);
-      }
+      const finalText = await this.guardFinalText(
+        this.config.showThinking ? (typeof content === "string" ? content : "") : (cleanContentWithoutTools || ""),
+        signal
+      );
 
       await this.saveHistory();
       return finalText;
@@ -434,8 +459,9 @@ export class Agent {
    * Executes the agent loop and yields chunks of the final text response in real-time.
    * Tool calls are handled transparently behind the scenes.
    *
-   * Output guardrails run on the full text once the stream has ended: a blocking
-   * guardrail throws after the text was streamed, and `sanitized` values cannot be applied.
+   * Output guardrails run on the full answer once the stream has ended: a blocking
+   * guardrail throws after the text was streamed, unless `guardrails.streamOutput` is
+   * "buffer" (the answer is then checked first and emitted in one chunk).
    */
   async *runStream(
     input: string | Message[],
@@ -449,27 +475,76 @@ export class Agent {
     }
   }
 
+  /** Streams one turn; returns the final (guarded) answer text. */
   private async *runStreamUnlocked(
     input: string | Message[],
     signal: AbortSignal | undefined
-  ): AsyncGenerator<string, void, unknown> {
-    await this.prepareTurn(input);
+  ): AsyncGenerator<string, string, unknown> {
+    await this.initialize();
+    const historyBefore = [...this.messageHistory];
+    try {
+      return yield* this.streamTurn(input, signal);
+    } catch (err) {
+      if (err instanceof GuardrailError) this.messageHistory = historyBefore;
+      throw err;
+    }
+  }
+
+  private async *streamTurn(
+    input: string | Message[],
+    signal: AbortSignal | undefined
+  ): AsyncGenerator<string, string, unknown> {
+    let { pendingInputCheck } = await this.prepareTurn(input, signal);
+    const buffering = this.config.guardrails?.streamOutput === "buffer";
 
     for (let iteration = 1; iteration <= this.config.maxIterations; iteration++) {
       this.log(`--- Iteration ${iteration} (Streaming) ---`);
 
       const toolsPayload = this.getToolsPayload();
-      this.log(`Calling LLM Stream (${this.config.model})...`);
-      const stream = this.llmClient.chatCompletionStream({
-        model: this.config.model,
-        messages: await this.prepareRequestMessages(this.messageHistory),
-        tools: toolsPayload.length > 0 ? toolsPayload : undefined,
-        temperature: this.config.temperature,
-        signal,
-      });
+      const openStream = async (callSignal: AbortSignal | undefined) => {
+        this.log(`Calling LLM Stream (${this.config.model})...`);
+        return this.llmClient.chatCompletionStream({
+          model: this.config.model,
+          messages: await this.prepareRequestMessages(this.messageHistory),
+          tools: toolsPayload.length > 0 ? toolsPayload : undefined,
+          temperature: this.config.temperature,
+          signal: callSignal,
+        });
+      };
+
+      let stream: AsyncGenerator<any, void, unknown>;
+      let firstChunk: Promise<IteratorResult<any, void>> | null = null;
+      if (pendingInputCheck) {
+        // Start the request (up to its first chunk) while the input guardrails run.
+        const check = pendingInputCheck;
+        pendingInputCheck = null;
+        const controller = new AbortController();
+        stream = await openStream(signal ? AbortSignal.any([signal, controller.signal]) : controller.signal);
+        firstChunk = stream.next();
+        firstChunk.catch(() => {});
+        let changed: boolean;
+        try {
+          changed = await check();
+        } catch (err) {
+          controller.abort();
+          await stream.return().catch(() => {});
+          throw err;
+        }
+        if (changed) {
+          this.log("Input sanitized by a guardrail: restarting the LLM call.");
+          controller.abort();
+          await stream.return().catch(() => {});
+          stream = await openStream(signal);
+          firstChunk = null;
+        }
+      } else {
+        stream = await openStream(signal);
+      }
 
       let accumulatedContent = "";
       let visibleText = "";
+      /** Reasoning-field output (with its <think> tags), re-emitted in buffer mode. */
+      let reasoningText = "";
       const nativeToolCalls: Record<number, { id?: string; name?: string; arguments: string }> = {};
       let hasNativeToolCalls = false;
       let streamUsage: Usage | undefined;
@@ -489,56 +564,75 @@ export class Agent {
         return this.config.showThinking ? "</think>" : null;
       };
 
-      for await (const chunk of stream) {
-        if (chunk.usage) streamUsage = chunk.usage;
-        const delta = chunk.choices?.[0]?.delta;
-        if (!delta) continue;
+      try {
+        while (true) {
+          const step = firstChunk ? await firstChunk : await stream.next();
+          firstChunk = null;
+          if (step.done) break;
+          const chunk = step.value;
+          if (chunk.usage) streamUsage = chunk.usage;
+          const delta = chunk.choices?.[0]?.delta;
+          if (!delta) continue;
 
-        const reasoningChunk: string | undefined = delta.reasoning_content ?? delta.reasoning;
-        if (typeof reasoningChunk === "string" && reasoningChunk.length > 0 && this.config.showThinking) {
-          if (!reasoningOpen) {
-            reasoningOpen = true;
-            yield "<think>";
+          const out: string[] = [];
+          const reasoning = (text: string) => { reasoningText += text; out.push(text); };
+
+          const reasoningChunk: string | undefined = delta.reasoning_content ?? delta.reasoning;
+          if (typeof reasoningChunk === "string" && reasoningChunk.length > 0 && this.config.showThinking) {
+            if (!reasoningOpen) {
+              reasoningOpen = true;
+              reasoning("<think>");
+            }
+            reasoning(reasoningChunk);
           }
-          yield reasoningChunk;
-        }
 
-        if (delta.tool_calls) {
-          const closeTag = closeReasoning();
-          if (closeTag) yield closeTag;
-          hasNativeToolCalls = true;
-          for (const tc of delta.tool_calls) {
-            const acc = (nativeToolCalls[tc.index] ??= { arguments: "" });
-            if (tc.id) acc.id = tc.id;
-            if (tc.function?.name) acc.name = tc.function.name;
-            if (tc.function?.arguments) acc.arguments += tc.function.arguments;
-          }
-        }
-
-        if (delta.content) {
-          const closeTag = closeReasoning();
-          if (closeTag) yield closeTag;
-          accumulatedContent += delta.content;
-          // Once native tool calls started, the text is no longer shown.
-          if (!hasNativeToolCalls) {
-            for (const out of parser.push(delta.content)) {
-              visibleText += out;
-              yield out;
+          if (delta.tool_calls) {
+            const closeTag = closeReasoning();
+            if (closeTag) reasoning(closeTag);
+            hasNativeToolCalls = true;
+            for (const tc of delta.tool_calls) {
+              const acc = (nativeToolCalls[tc.index] ??= { arguments: "" });
+              if (tc.id) acc.id = tc.id;
+              if (tc.function?.name) acc.name = tc.function.name;
+              if (tc.function?.arguments) acc.arguments += tc.function.arguments;
             }
           }
+
+          if (delta.content) {
+            const closeTag = closeReasoning();
+            if (closeTag) reasoning(closeTag);
+            accumulatedContent += delta.content;
+            // Once native tool calls started, the text is no longer shown.
+            if (!hasNativeToolCalls) {
+              for (const text of parser.push(delta.content)) {
+                visibleText += text;
+                out.push(text);
+              }
+            }
+          }
+
+          if (!buffering) for (const text of out) yield text;
         }
+      } finally {
+        // Closes the HTTP stream if the consumer stopped early or an error occurred.
+        await stream.return().catch(() => {});
       }
 
       // Close the reasoning block if the stream ended while still open
       // (e.g. reasoning with no following content or tool call).
+      const tail: string[] = [];
       const closeTag = closeReasoning();
-      if (closeTag) yield closeTag;
+      if (closeTag) {
+        reasoningText += closeTag;
+        tail.push(closeTag);
+      }
       if (!hasNativeToolCalls) {
-        for (const out of parser.flush()) {
-          visibleText += out;
-          yield out;
+        for (const text of parser.flush()) {
+          visibleText += text;
+          tail.push(text);
         }
       }
+      if (!buffering) for (const text of tail) yield text;
 
       this.recordUsage(streamUsage);
 
@@ -568,17 +662,16 @@ export class Agent {
       });
 
       if (toolCalls.length > 0) {
-        await this.handleToolCalls(toolCalls);
+        // In buffer mode, text produced before a tool call is dropped, like run() does.
+        await this.handleToolCalls(toolCalls, signal);
         continue;
       }
 
-      if (this.config.guardrails?.output?.length) {
-        const finalText = this.config.showThinking ? visibleText : (processThinking(visibleText).cleanContent ?? "");
-        await this.runGuardrails(finalText, this.config.guardrails.output);
-      }
+      const finalText = await this.guardFinalText(visibleText, signal);
+      if (buffering && reasoningText + finalText) yield reasoningText + finalText;
 
       await this.saveHistory();
-      return;
+      return finalText;
     }
 
     throw new Error(`Agent run exceeded max iterations (${this.config.maxIterations}) without returning a final response.`);
@@ -601,20 +694,23 @@ export class Agent {
     const self = this;
     async function* gen(): AsyncGenerator<string, void, unknown> {
       const release = await self.acquireRunLock();
-      let accumulated = "";
       try {
-        for await (const chunk of self.runStreamUnlocked(input, structuredConfig.signal)) {
-          accumulated += chunk;
-          yield chunk;
-        }
-        const validation = validateStructuredOutput(accumulated, structuredConfig.schema);
+        await self.initialize();
+        const historyBefore = [...self.messageHistory];
+        // The stream's return value is the final answer, already checked by the output guardrails.
+        const finalText = yield* self.runStreamUnlocked(input, structuredConfig.signal);
+        const validation = validateStructuredOutput(finalText, structuredConfig.schema);
         if (validation.success) {
           resolve(validation.data);
         } else {
           try {
-            resolve(await self.retryStructuredOutputCorrection(structuredConfig, validation.error, structuredConfig.signal));
+            const corrected = await self.retryStructuredOutputCorrection<T>(structuredConfig, validation.error, structuredConfig.signal);
+            resolve(await self.guardStructuredOutput<T>(corrected, structuredConfig.schema, structuredConfig.signal));
             await self.saveHistory();
-          } catch (e: any) { reject(e); }
+          } catch (e: any) {
+            if (e instanceof GuardrailError) self.messageHistory = historyBefore;
+            reject(e);
+          }
         }
       } catch (e: any) {
         reject(e instanceof Error ? e : new Error(String(e)));
@@ -720,29 +816,173 @@ export class Agent {
     return release;
   }
 
-  /** Initializes if needed, applies input guardrails and appends the input to the history. */
-  private async prepareTurn(input: string | Message[]): Promise<{ isLfm: boolean }> {
+  /**
+   * Initializes if needed and appends the input to the history. Input guardrails run
+   * right away, or are returned as `pendingInputCheck` when `parallelInput` is enabled.
+   */
+  private async prepareTurn(
+    input: string | Message[],
+    signal: AbortSignal | undefined
+  ): Promise<{ isLfm: boolean; pendingInputCheck: (() => Promise<boolean>) | null }> {
     await this.initialize();
 
+    // Index of the first message of the new turn (the messages the input guardrails check).
+    let turnStart: number;
     if (typeof input === "string") {
-      const sanitized = this.config.guardrails?.input?.length
-        ? await this.runGuardrails(input, this.config.guardrails.input)
-        : input;
       if (this.messageHistory.length === 0) {
         this.messageHistory.push({ role: "system", content: this.buildSystemPrompt() });
       }
-      this.messageHistory.push({ role: "user", content: sanitized });
+      turnStart = this.messageHistory.length;
+      this.messageHistory.push({ role: "user", content: input });
     } else {
       this.messageHistory = [...input];
       if (!this.messageHistory.some(m => m.role === "system")) {
         this.messageHistory.unshift({ role: "system", content: this.buildSystemPrompt() });
+      }
+      // With a full message list, the new turn is everything after the last assistant message.
+      turnStart = 0;
+      for (let i = this.messageHistory.length - 1; i >= 0; i--) {
+        if (this.messageHistory[i].role === "assistant") { turnStart = i + 1; break; }
       }
     }
 
     const format = this.config.toolCallFormat;
     const isLfm = format === "lfm" || (format === "auto" && this.config.model.toLowerCase().includes("lfm"));
     if (isLfm) this.injectLfmToolList();
-    return { isLfm };
+
+    if (!this.config.guardrails?.input?.length) return { isLfm, pendingInputCheck: null };
+    const check = () => this.checkInput(turnStart, signal);
+    if (this.config.guardrails.parallelInput) return { isLfm, pendingInputCheck: check };
+    await check();
+    return { isLfm, pendingInputCheck: null };
+  }
+
+  /**
+   * Runs the input guardrails on the text of the user messages from `turnStart`
+   * (each text part of a multimodal message is checked separately; images, files and
+   * audio are not inspected). Sanitized text replaces the original in the history.
+   * @returns true when a guardrail changed the input.
+   */
+  private async checkInput(turnStart: number, signal: AbortSignal | undefined): Promise<boolean> {
+    const fns = this.config.guardrails?.input ?? [];
+    const ctx = this.guardrailContext("input", signal);
+    let changed = false;
+
+    for (let i = turnStart; i < this.messageHistory.length; i++) {
+      const message = this.messageHistory[i];
+      if (message.role !== "user") continue;
+
+      if (typeof message.content === "string") {
+        const sanitized = await applyGuardrails(message.content, fns, ctx);
+        if (sanitized !== message.content) {
+          this.messageHistory[i] = { ...message, content: sanitized };
+          changed = true;
+        }
+      } else if (Array.isArray(message.content)) {
+        let partsChanged = false;
+        const parts = [];
+        for (const part of message.content) {
+          if (part.type !== "text") { parts.push(part); continue; }
+          const sanitized = await applyGuardrails(part.text, fns, ctx);
+          partsChanged ||= sanitized !== part.text;
+          parts.push(sanitized === part.text ? part : { ...part, text: sanitized });
+        }
+        if (partsChanged) {
+          this.messageHistory[i] = { ...message, content: parts };
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * Sends the first LLM call while the input guardrails run. A block aborts the call;
+   * a sanitized input discards it and sends the call again with the new history.
+   */
+  private async callWithParallelInputCheck<R>(
+    check: () => Promise<boolean>,
+    call: (signal: AbortSignal | undefined) => Promise<R>,
+    signal: AbortSignal | undefined
+  ): Promise<R> {
+    const controller = new AbortController();
+    const pending = call(signal ? AbortSignal.any([signal, controller.signal]) : controller.signal);
+    pending.catch(() => {});
+    let changed: boolean;
+    try {
+      changed = await check();
+    } catch (err) {
+      controller.abort();
+      throw err;
+    }
+    if (!changed) return pending;
+    this.log("Input sanitized by a guardrail: restarting the LLM call.");
+    controller.abort();
+    return call(signal);
+  }
+
+  private guardrailContext(stage: GuardrailStage, signal: AbortSignal | undefined, toolName?: string): GuardrailContext {
+    return { stage, agentName: this.config.name, messages: this.messageHistory, signal, ...(toolName ? { toolName } : {}) };
+  }
+
+  /**
+   * Runs the output guardrails on the final answer. A sanitized answer also replaces
+   * the last assistant message, so the raw text is neither re-sent nor persisted.
+   */
+  private async guardFinalText(text: string, signal: AbortSignal | undefined): Promise<string> {
+    const fns = this.config.guardrails?.output;
+    if (!fns?.length) return text;
+    const sanitized = await applyGuardrails(text, fns, this.guardrailContext("output", signal));
+    if (sanitized !== text) this.replaceLastAssistantContent(sanitized);
+    return sanitized;
+  }
+
+  /**
+   * Runs the output guardrails on a structured answer (as JSON text). A sanitized
+   * answer is parsed and validated again against the schema.
+   */
+  private async guardStructuredOutput<T extends z.ZodType>(
+    data: z.infer<T>,
+    schema: T,
+    signal: AbortSignal | undefined
+  ): Promise<z.infer<T>> {
+    const fns = this.config.guardrails?.output;
+    if (!fns?.length) return data;
+    const json = JSON.stringify(data);
+    const sanitized = await applyGuardrails(json, fns, this.guardrailContext("output", signal));
+    if (sanitized === json) return data;
+
+    const revalidated = validateStructuredOutput(sanitized, schema);
+    if (!revalidated.success) {
+      throw new GuardrailError("output", "schema", `Sanitized output no longer matches the schema: ${revalidated.error}`);
+    }
+    this.replaceLastAssistantContent(sanitized);
+    return revalidated.data;
+  }
+
+  private replaceLastAssistantContent(content: string): void {
+    for (let i = this.messageHistory.length - 1; i >= 0; i--) {
+      if (this.messageHistory[i].role === "assistant") {
+        this.messageHistory[i] = { ...this.messageHistory[i], content };
+        return;
+      }
+    }
+  }
+
+  /**
+   * Runs the tool-result guardrails. A blocked result is replaced by an error message
+   * for the model, or aborts the run when `onToolResultBlocked` is "throw".
+   */
+  private async guardToolResult(content: string, toolName: string, signal: AbortSignal | undefined): Promise<string> {
+    const fns = this.config.guardrails?.toolResults;
+    if (!fns?.length) return content;
+    try {
+      return await applyGuardrails(content, fns, this.guardrailContext("toolResult", signal, toolName));
+    } catch (err) {
+      if (!(err instanceof GuardrailError) || this.config.guardrails?.onToolResultBlocked === "throw") throw err;
+      this.logger.warn(`Result of tool '${toolName}' blocked by guardrail '${err.guardrail}': ${err.reason}`);
+      return JSON.stringify({ error: `Tool result blocked by guardrail '${err.guardrail}': ${err.reason}` });
+    }
   }
 
   /** LFM templates expect the tool list inside the system prompt. */
@@ -810,20 +1050,22 @@ export class Agent {
   }
 
   /** Executes the tool calls and appends their results to the history. */
-  private async handleToolCalls(toolCalls: ToolCall[]): Promise<void> {
+  private async handleToolCalls(toolCalls: ToolCall[], signal: AbortSignal | undefined): Promise<void> {
     this.log(`Tool Calls requested: ${toolCalls.map(tc => tc.function.name).join(", ")}`);
     const results = this.config.parallelTools && toolCalls.length > 1
       ? await Promise.all(toolCalls.map((tc) => this.executeTool(tc)))
       : await this.executeToolsSequential(toolCalls);
 
     const maxChars = this.config.context.maxToolResultChars;
-    toolCalls.forEach((tc, i) => {
+    for (const [i, tc] of toolCalls.entries()) {
       let content = results[i];
       if (maxChars && content.length > maxChars) {
         content = `${content.slice(0, maxChars)}\n…[truncated ${content.length - maxChars} characters]`;
       }
+      // Guard what the model will actually see (after truncation).
+      content = await this.guardToolResult(content, tc.function.name, signal);
       this.messageHistory.push({ role: "tool", name: tc.function.name, tool_call_id: tc.id, content });
-    });
+    }
   }
 
   private async executeToolsSequential(toolCalls: ToolCall[]): Promise<string[]> {
@@ -993,18 +1235,6 @@ export class Agent {
 
   getName(): string {
     return this.config.name;
-  }
-
-  private async runGuardrails(text: string, fns: GuardrailFn[]): Promise<string> {
-    let current = text;
-    for (const fn of fns) {
-      const result = await fn(current);
-      if (!result.allowed) {
-        throw new Error(`[Guardrail] ${result.reason ?? "Input blocked by guardrail."}`);
-      }
-      if (result.sanitized !== undefined) current = result.sanitized;
-    }
-    return current;
   }
 
   private async saveHistory(): Promise<void> {

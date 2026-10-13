@@ -301,7 +301,7 @@ describe("Agent.runStream", () => {
   });
 
   it("applies input and output guardrails", async () => {
-    mockFetch([streamOf(["mot interdit"])]);
+    const http = mockFetch([streamOf(["mot interdit"])]);
     const agent = newAgent({
       guardrails: {
         input: [redactPII()],
@@ -309,7 +309,9 @@ describe("Agent.runStream", () => {
       },
     });
     await expect(collect(agent.runStream("a@b.fr"))).rejects.toThrow(/\[Guardrail\] interdit/);
-    expect(agent.getHistory()[1].content).toBe("[EMAIL]");
+    expect(http.body(0).messages[1].content).toBe("[EMAIL]");
+    // A blocked turn is rolled back.
+    expect(agent.getHistory()).toEqual([]);
   });
 
   it("parses a final SSE event without trailing newline", async () => {

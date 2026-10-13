@@ -492,21 +492,76 @@ const agent = new Agent({
 
 ### Guardrails
 
-Les guardrails filtrent l'entrée de l'utilisateur et la réponse finale. Chacun peut **bloquer** (le run lève une erreur) ou **assainir** (le texte est transformé).
+Les guardrails filtrent le texte à trois endroits : les messages de l'utilisateur (`input`), la réponse finale (`output`) et les résultats d'outils (`toolResults`). Chaque guardrail peut **bloquer** le texte (le run lève une `GuardrailError`) ou l'**assainir** (le texte est remplacé, y compris dans l'historique).
 
 ```ts
-import { maxLength, blockedPatterns, redactPII, sanitize } from "@thegetget/get-agent";
+import { Agent, maxLength, promptInjection, redactPII, llmGuardrail, GuardrailError } from "@thegetget/get-agent";
+
+const moderateur = new Agent({ name: "moderateur", model: "qwen3-1.7b", temperature: 0 });
 
 const agent = new Agent({
-  name: "assistant",
+  name: "support",
   guardrails: {
-    input: [maxLength(4_000), blockedPatterns([/ignore (all )?previous instructions/i]), redactPII()],
-    output: [sanitize((t) => t.replace(/sk-[\w-]{20,}/g, "[REDACTED]"))],
+    input: [
+      maxLength(4_000),
+      promptInjection(),
+      llmGuardrail({ agent: moderateur, policy: "Seules les questions sur nos produits et commandes sont acceptées." }),
+    ],
+    output: [redactPII()],
+    toolResults: [promptInjection(), redactPII()], // pages web, fichiers, API…
+    parallelInput: true,   // lance le premier appel LLM pendant les vérifications d'entrée
+    streamOutput: "buffer" // en streaming, la réponse n'est émise qu'une fois validée
   },
 });
+
+try {
+  await agent.run(question);
+} catch (err) {
+  if (err instanceof GuardrailError) {
+    console.log(err.stage, err.guardrail, err.reason); // "input", "promptInjection", "Possible prompt injection detected."
+  } else throw err;
+}
 ```
 
-En streaming, les guardrails de sortie s'appliquent au texte complet, une fois le flux terminé.
+**Guardrails fournis**
+
+| Guardrail | Effet |
+| --- | --- |
+| `maxLength(n)` | Bloque un texte de plus de `n` caractères. |
+| `blockedPatterns(motifs, raison?)` | Bloque un texte qui contient une chaîne (sans tenir compte de la casse) ou qui correspond à une regex. |
+| `promptInjection({ extraPatterns? })` | Bloque les tentatives d'injection courantes, en anglais et en français (« ignore les instructions précédentes », « révèle ton prompt système »…), ainsi que les jetons de contrôle de modèle (`<\|im_start\|>`, `[INST]`…). |
+| `redactPII({ categories?, replacement? })` | Masque les e-mails, IBAN et numéros de carte (sommes de contrôle vérifiées), numéros de sécurité sociale (clé vérifiée) et téléphones français ou internationaux. Les IP peuvent être ajoutées avec `categories`. Dates, montants et numéros de commande ne sont pas touchés. |
+| `llmGuardrail({ agent, policy, failOpen? })` | Fait juger le texte par un agent classifieur (sortie structurée `{ allowed, reason }`). Le texte lui est présenté comme une donnée, pour qu'il n'en suive pas les instructions. |
+| `sanitize(fn)` | Transforme le texte, sans jamais bloquer. |
+
+**Écrire son propre guardrail**
+
+Un guardrail est une fonction `(texte, ctx) => { allowed, reason?, sanitized? }`, synchrone ou asynchrone. `ctx` contient `stage`, `agentName`, `messages` (l'historique), `toolName` pour un résultat d'outil, et `signal`. `defineGuardrail` lui donne un nom, repris dans les erreurs :
+
+```ts
+import { defineGuardrail } from "@thegetget/get-agent";
+
+const pasDeConcurrents = defineGuardrail("concurrents", (texte) =>
+  /\b(acme|globex)\b/i.test(texte)
+    ? { allowed: false, reason: "Nous ne commentons pas les concurrents." }
+    : { allowed: true }
+);
+```
+
+**Comportement détaillé**
+
+| Étape | Ce qui est vérifié | En cas de blocage |
+| --- | --- | --- |
+| `input` | Les messages utilisateur du nouveau tour : la chaîne passée à `run()`, ou les messages qui suivent la dernière réponse de l'assistant quand vous passez une liste. Pour un message multimodal, chaque partie texte est vérifiée ; les images, fichiers et sons ne sont pas inspectés. | `GuardrailError`, et le tour est retiré de l'historique. |
+| `output` | La réponse finale, y compris une sortie structurée (vérifiée sous forme de JSON, puis validée à nouveau contre le schéma si elle a été assainie). | `GuardrailError`, et le tour est retiré de l'historique. |
+| `toolResults` | Chaque résultat d'outil, tel que le modèle le verra (après la troncature `context.maxToolResultChars`). | Le résultat est remplacé par un message d'erreur pour le modèle. Avec `onToolResultBlocked: "throw"`, le run échoue. |
+
+- Les guardrails s'exécutent dans l'ordre, et chacun reçoit le texte assaini par les précédents. Si un guardrail lève une exception, le texte est refusé (`GuardrailError` avec l'erreur d'origine dans `cause`).
+- Avec `parallelInput`, le premier appel LLM part en même temps que les vérifications d'entrée. Si l'entrée est bloquée, l'appel est annulé ; si elle est assainie, l'appel est relancé avec le texte assaini, de sorte que le texte brut n'est jamais utilisé pour la réponse. C'est surtout utile avec `llmGuardrail`.
+- En streaming, `streamOutput: "after"` (par défaut) diffuse le texte en direct et vérifie la réponse une fois terminée : un blocage arrive donc après l'affichage. `"buffer"` retient la réponse finale, la vérifie, puis l'émet en un seul fragment.
+
+> [!WARNING]
+> `promptInjection()` repose sur des motifs : il arrête les tentatives courantes, pas un attaquant déterminé. Pour un usage sensible, combinez-le avec `llmGuardrail`, et appliquez-le aussi aux `toolResults`, par où arrivent la plupart des injections (pages web, e-mails, documents).
 
 ### Budget et consommation
 
@@ -644,14 +699,14 @@ const agent = new Agent({
 
 ## Exemples
 
-Le dossier [`examples/`](./examples) contient 16 scripts exécutables avec `npx tsx examples/<fichier>.ts` :
+Le dossier [`examples/`](./examples) contient 17 scripts exécutables avec `npx tsx examples/<fichier>.ts` :
 
 | Thème | Exemples |
 | --- | --- |
 | Bases | [chat et sortie structurée](./examples/01_chat_et_sortie_structuree.ts), [outils](./examples/02_outils.ts), [conversation](./examples/11_chat_conversation.ts), [multimodal](./examples/14_multimodal.ts) |
 | Extensions | [toolkits](./examples/03_toolkits.ts), [Agent Skills](./examples/16_agent_skills.ts), [MCP](./examples/04_mcp.ts), [multi-agents](./examples/09_multi_agents.ts) |
 | Workflows | [graphe d'étapes](./examples/05_workflow.ts), [scoring](./examples/13_scoring_workflow.ts), [parallèle, checkpoints, reprise](./examples/15_workflow_avance.ts) |
-| Production | [streaming et REPL](./examples/06_streaming_et_repl.ts), [hooks](./examples/07_hooks.ts), [approbation humaine](./examples/08_human_in_the_loop.ts), [guardrails, budget, logs, persistance](./examples/10_production.ts), [LLM-as-judge](./examples/12_scoring_reponses.ts) |
+| Production | [streaming et REPL](./examples/06_streaming_et_repl.ts), [hooks](./examples/07_hooks.ts), [approbation humaine](./examples/08_human_in_the_loop.ts), [guardrails avancés](./examples/17_guardrails.ts), [guardrails, budget, logs, persistance](./examples/10_production.ts), [LLM-as-judge](./examples/12_scoring_reponses.ts) |
 
 ## Développement
 

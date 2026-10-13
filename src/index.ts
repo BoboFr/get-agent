@@ -43,8 +43,27 @@ export { Logger } from "./logger.js";
 export type { LogLevel, LogEntry, LoggerConfig } from "./logger.js";
 export { FileHistoryAdapter } from "./history.js";
 export type { HistoryAdapter } from "./history.js";
-export { maxLength, blockedPatterns, sanitize, redactPII } from "./guardrails.js";
-export type { Guardrails, GuardrailFn, GuardrailResult } from "./guardrails.js";
+export {
+  maxLength,
+  blockedPatterns,
+  sanitize,
+  redactPII,
+  promptInjection,
+  llmGuardrail,
+  defineGuardrail,
+  applyGuardrails,
+  GuardrailError,
+} from "./guardrails.js";
+export type {
+  Guardrails,
+  GuardrailFn,
+  GuardrailResult,
+  GuardrailContext,
+  GuardrailStage,
+  PIICategory,
+  RedactPIIOptions,
+  LLMGuardrailOptions,
+} from "./guardrails.js";
 export {
   text,
   toDataUrl,
