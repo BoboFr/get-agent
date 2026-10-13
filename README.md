@@ -1,1004 +1,614 @@
+<div align="center">
+
 # GetAgent
 
-GetAgent est un framework léger et puissant en TypeScript permettant de concevoir des agents IA autonomes. Il intègre nativement la validation de schéma avec **Zod**, la création d'outils (tool calling), la connexion à des serveurs **MCP (Model Context Protocol)** et l'orchestration sous forme de **Workflows**.
+**Agents IA et workflows typés en TypeScript, pensés pour les LLM locaux comme pour les API distantes.**
+
+[![npm](https://img.shields.io/npm/v/@thegetget/get-agent?color=cb3837&logo=npm)](https://www.npmjs.com/package/@thegetget/get-agent)
+[![license](https://img.shields.io/npm/l/@thegetget/get-agent)](#licence)
+[![node](https://img.shields.io/node/v/@thegetget/get-agent?logo=node.js&logoColor=white)](https://nodejs.org)
+[![types](https://img.shields.io/npm/types/@thegetget/get-agent?logo=typescript&logoColor=white)](https://www.typescriptlang.org)
+
+[Démarrage rapide](#démarrage-rapide) · [Concepts](#concepts) · [Workflows](#workflows) · [Production](#en-production) · [Référence API](#référence-api) · [Exemples](./examples)
+
+</div>
 
 ---
 
-## Fonctionnalités Clés
+GetAgent fournit la boucle agent (LLM → outils → LLM), la validation Zod de bout en bout, le support MCP et un moteur de workflows à base de graphe, dans un paquet léger sans framework imposé. Il fonctionne avec n'importe quelle API compatible OpenAI : llama.cpp, Ollama, vLLM, LM Studio, OpenAI, OpenRouter…
 
-- 🤖 **Agent Loop autonome** : Résolution de tâches complexes en plusieurs étapes.
-- 🛠️ **Outils Typés (Tools)** : Création d'outils simples avec validation automatique des arguments grâce à Zod.
-- 🧩 **Skills** : Modules réutilisables regroupant outils, prompt système et hooks de lifecycle.
-- 🔌 **Support MCP** : Connexion transparente à n'importe quel serveur MCP standard pour étendre instantanément les capacités de l'agent.
-- 🎯 **Sorties Structurées (Structured Output)** : Garantie que la réponse finale de l'agent respecte un schéma Zod précis.
-- 🖼️ **Multimodal** : Envoi d'images, de documents (PDF, texte…) et d'audio via des helpers (`imageFromFile`, `fileFromPath`, `userMessage`…).
-- ⛓️ **Workflows** : Définition de graphes d'étapes (synchrones ou conditionnels) avec gestion d'état centralisée.
-- 📡 **Streaming** : Diffusion des réponses token par token, avec gestion transparente des appels d'outils.
-- 🪝 **Hooks / Middleware** : Interception du cycle de vie (avant/après appel LLM, avant/après exécution d'outil).
-- 🧑‍⚖️ **Human-in-the-Loop** : Approbation humaine requise avant l'exécution d'outils sensibles.
-- 🪆 **Agent-as-Tool** : Exposition d'un agent comme outil appelable par un autre agent (sous-agents).
-- 💰 **Budget & Usage** : Suivi des tokens, estimation des coûts et plafonds (tokens / USD).
-- 🛡️ **Guardrails** : Filtres d'entrée/sortie (longueur max, motifs bloqués, redaction de PII).
-- 💾 **Persistance** : Sauvegarde et reprise de l'historique de conversation entre sessions.
-- 📊 **Logger structuré** : Journalisation configurable (niveaux, format texte/JSON, transport personnalisé).
-- 🔁 **Robustesse** : Retries avec backoff exponentiel sur les appels LLM et exécution parallèle des outils.
+```ts
+import { Agent, createTool } from "@thegetget/get-agent";
+import { z } from "zod";
 
----
+const meteo = createTool(
+  "meteo",
+  "Donne la météo actuelle d'une ville.",
+  z.object({ ville: z.string() }),
+  async ({ ville }) => ({ ville, temperature: 21, ciel: "dégagé" })
+);
+
+const agent = new Agent({ name: "assistant", model: "qwen3-8b", tools: [meteo] });
+
+console.log(await agent.run("Quel temps fait-il à Lyon ?"));
+```
+
+## Pourquoi GetAgent
+
+- **Typé de bout en bout.** Les arguments des outils, les sorties structurées et l'état des workflows sont décrits avec Zod, validés à l'exécution et inférés par TypeScript.
+- **Compatible avec les modèles locaux.** Les appels d'outils sont reconnus même quand le modèle ne suit pas l'API `tool_calls` : balises Hermes/Qwen `<tool_call>`, marqueurs LFM, JSON nu, syntaxe pythonique. Les arguments `"42"` sont convertis en nombres quand le schéma l'exige.
+- **Prêt pour la production.** Retries avec backoff, timeouts, `AbortSignal`, budget en tokens et en dollars, guardrails, hooks, logs structurés, persistance de l'historique.
+- **Workflows durables.** Graphe d'étapes avec branches conditionnelles, étapes parallèles, retry par étape, trace d'exécution, checkpoints et reprise après échec.
+- **Léger.** Une dépendance d'exécution (`@modelcontextprotocol/sdk`), Zod en peer dependency, `fetch` natif, ESM.
+
+## Sommaire
+
+- [Installation](#installation)
+- [Démarrage rapide](#démarrage-rapide)
+- [Concepts](#concepts) : [Agent](#agent) · [Outils](#outils) · [Sortie structurée](#sortie-structurée) · [Streaming](#streaming) · [Multimodal](#multimodal) · [MCP](#mcp) · [Skills](#skills) · [Multi-agents](#multi-agents)
+- [Workflows](#workflows)
+- [En production](#en-production) : [Hooks](#hooks) · [Approbation humaine](#approbation-humaine) · [Guardrails](#guardrails) · [Budget](#budget-et-consommation) · [Historique](#persistance-de-lhistorique) · [Fiabilité](#fiabilité-et-annulation) · [Logs](#logs)
+- [Référence API](#référence-api)
+- [Exemples](#exemples)
+- [Développement](#développement)
 
 ## Installation
-
-Installez les dépendances du projet dans votre environnement TypeScript :
 
 ```bash
 npm install @thegetget/get-agent zod@^4
 ```
 
-> ⚠️ **Version de Zod requise : v4 (`^4.0.0`).** GetAgent déclare `zod` en `peerDependency` sur la branche v4 et s'appuie sur le convertisseur natif `z.toJSONSchema()`. Si votre projet a encore Zod v3, mettez à jour avec `npm install zod@^4` — sinon vous obtiendrez une erreur de types `TS2740` au passage d'un schéma à `agent.run()` (les classes `ZodType` de v3 et v4 ne sont pas structurellement compatibles).
+| Prérequis | Version |
+| --- | --- |
+| Node.js | ≥ 20.3 |
+| Zod | ^4.0.0 (peer dependency) |
+| Module | ESM uniquement |
 
-> ℹ️ **Node.js ≥ 20.3 requis** (utilisation de `fetch`, `AbortSignal.any` et `structuredClone` natifs).
+> [!IMPORTANT]
+> GetAgent utilise le convertisseur natif `z.toJSONSchema()` de **Zod v4**. Avec Zod v3, TypeScript renvoie une erreur `TS2740` dès qu'un schéma est passé à l'agent.
 
----
+## Démarrage rapide
 
-## Exemples Concrets
+**1. Lancez un modèle** sur un serveur compatible OpenAI, par exemple avec llama.cpp :
 
-### 1. Agent Simple (Chat)
-
-Voici comment initialiser et exécuter un agent de base avec un LLM local ou distant compatible OpenAI.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
-// Initialisation de l'agent
-const agent = new Agent({
-  name: "Assistant",
-  systemPrompt: "Tu es un traducteur de texte concis en français.",
-  model: "Qwen3.5-9B.gguf", // Nom du modèle à utiliser
-  baseUrl: "", // URL de votre API compatible OpenAI
-  apiKey: "votre-cle-api", // Facultatif
-});
-
-// Exécution de l'agent
-const response = await agent.run("Translate to French: 'Hello world, how are you today?'");
-console.log(response);
+```bash
+llama-server -m Qwen3-8B-Q4_K_M.gguf --port 8080 --jinja
 ```
 
-### 2. Création et Utilisation d'Outils (Tools)
+**2. Créez un agent** qui pointe vers ce serveur :
 
-Vous pouvez enrichir votre agent en lui donnant accès à des fonctions personnalisées. Les arguments d'entrée sont automatiquement validés avec Zod.
+```ts
+import { Agent } from "@thegetget/get-agent";
 
-```typescript
-import { Agent, createTool } from "@thegetget/get-agent";
+const agent = new Agent({
+  name: "assistant",
+  baseUrl: "http://127.0.0.1:8080/v1", // valeur par défaut
+  model: "qwen3-8b",
+  systemPrompt: "Tu réponds en français, de façon concise.",
+});
+
+console.log(await agent.run("Explique le protocole MCP en une phrase."));
+```
+
+Pour une API hébergée, renseignez `baseUrl` et `apiKey` :
+
+```ts
+const agent = new Agent({
+  name: "assistant",
+  baseUrl: "https://api.openai.com/v1",
+  apiKey: process.env.OPENAI_API_KEY,
+  model: "gpt-4o-mini",
+});
+```
+
+## Concepts
+
+### Agent
+
+Un `Agent` encapsule un modèle, un prompt système, des outils et un historique de conversation. `run()` exécute la boucle : il appelle le LLM, exécute les outils demandés, renvoie les résultats au LLM, et recommence jusqu'à obtenir une réponse finale (limite fixée par `maxIterations`).
+
+```ts
+await agent.run("Bonjour, je m'appelle Léa.");
+await agent.run("Comment je m'appelle ?"); // l'historique est conservé entre les appels
+
+agent.getHistory();   // messages échangés
+agent.clearHistory(); // repartir de zéro
+```
+
+`run()` accepte aussi une liste de messages, qui remplace alors l'historique :
+
+```ts
+await agent.run([
+  { role: "user", content: "Combien font 2 + 2 ?" },
+  { role: "assistant", content: "4" },
+  { role: "user", content: "Et multiplié par 10 ?" },
+]);
+```
+
+> [!NOTE]
+> Les appels `run` / `runStream` sur une **même instance** sont mis en file, car ils partagent l'historique. Pour traiter des requêtes en parallèle, créez une instance par requête ou par session.
+
+### Outils
+
+`createTool` associe un nom, une description destinée au modèle, un schéma Zod et une fonction. Les arguments sont validés avant l'exécution ; en cas d'erreur, le modèle reçoit le message de validation et peut corriger son appel.
+
+```ts
+import { createTool } from "@thegetget/get-agent";
 import { z } from "zod";
 
-// 1. Définition de l'outil avec validation Zod
 const calculTva = createTool(
-  "calculTva",
-  "Calcule le montant de la TVA pour un prix hors taxe donné.",
+  "calcul_tva",
+  "Calcule la TVA et le prix TTC à partir d'un prix hors taxes.",
   z.object({
-    prixHT: z.number().describe("Le prix hors taxes en euros"),
-    taux: z.number().default(20).describe("Le taux de TVA en pourcentage (ex: 20 pour 20%)"),
+    prixHT: z.number().describe("Prix hors taxes en euros"),
+    taux: z.number().default(20).describe("Taux de TVA en pourcentage"),
   }),
-  ({ prixHT, taux }) => {
-    const montantTVA = prixHT * (taux / 100);
-    const prixTTC = prixHT + montantTVA;
-    return { montantTVA, prixTTC };
-  }
+  ({ prixHT, taux }) => ({ tva: prixHT * (taux / 100), ttc: prixHT * (1 + taux / 100) })
 );
 
-// 2. Initialisation de l'agent avec l'outil
-const agent = new Agent({
-  name: "Comptable",
-  model: "Qwen3.5-9B.gguf",
-  tools: [calculTva],
-});
-
-// L'agent va décider d'appeler l'outil pour répondre à la question
-const response = await agent.run("Quel est le montant de la TVA et le prix TTC pour un article à 150€ HT avec un taux de 20% ?");
-console.log(response);
+const agent = new Agent({ name: "comptable", tools: [calculTva], parallelTools: true });
 ```
 
-### 3. Sortie Structurée (Structured Output)
+Avec `parallelTools: true`, les appels d'outils demandés dans un même tour s'exécutent en parallèle.
 
-Vous pouvez forcer l'agent à retourner un objet JSON strictement conforme à un schéma Zod.
+### Sortie structurée
 
-```typescript
-import { Agent } from "@thegetget/get-agent";
-import { z } from "zod";
+Passez un schéma Zod : le résultat est validé et typé. Si la réponse du modèle n'est pas valide, l'agent lui renvoie l'erreur et lui demande de corriger (3 tentatives par défaut).
 
-const agent = new Agent({
-  name: "Extracteur",
-  model: "Qwen3.5-9B.gguf",
-});
-
-// Définition du schéma attendu
-const schemaProfil = z.object({
+```ts
+const Profil = z.object({
   nom: z.string(),
   age: z.number(),
   competences: z.array(z.string()),
 });
 
-// Exécution avec le schéma en option
-const result = await agent.run(
-  "Extrais les informations suivantes du texte : 'Thomas a 28 ans et il maîtrise TypeScript, React et Node.js.'",
-  { schema: schemaProfil }
+const profil = await agent.run(
+  "Thomas a 28 ans et maîtrise TypeScript, React et Node.js.",
+  { schema: Profil, maxRetries: 2 }
 );
-
-// Le résultat est typé et validé
-console.log(result);
-// Exemple de sortie : { nom: "Thomas", age: 28, competences: [ "TypeScript", "React", "Node.js" ] }
+// profil : { nom: string; age: number; competences: string[] }
 ```
 
-### 3.1. Multimodal — Images & Documents
+### Streaming
 
-Envoyez des images, des documents (PDF, texte…) ou de l'audio à un modèle multimodal
-grâce au format de *content parts* compatible OpenAI. Construisez les messages avec
-`userMessage(...)` et les helpers de contenu.
+`runStream()` renvoie un `AsyncGenerator` de fragments de texte. Les appels d'outils sont exécutés en coulisse ; seul le texte destiné à l'utilisateur est émis.
 
-```typescript
-import {
-  Agent,
-  userMessage,
-  imageFromUrl,
-  imageFromFile,
-  fileFromPath,
-} from "@thegetget/get-agent";
+```ts
+for await (const chunk of agent.runStream("Raconte une histoire courte.")) {
+  process.stdout.write(chunk);
+}
+```
 
-const agent = new Agent({ name: "Vision", model: "Qwen2.5-VL-7B.gguf" });
+Le raisonnement des modèles (`<think>…</think>` ou champ `reasoning_content`) est émis sous forme de bloc `<think>`. Pour le masquer, passez `showThinking: false`.
 
-// Image distante
+Pour diffuser le texte **et** obtenir un objet validé à la fin :
+
+```ts
+const { stream, result } = agent.runStreamStructured("Propose un titre et 5 mots-clés.", {
+  schema: z.object({ titre: z.string(), motsCles: z.array(z.string()) }),
+});
+
+for await (const chunk of stream) process.stdout.write(chunk);
+const { titre, motsCles } = await result;
+```
+
+### Multimodal
+
+Les images, documents et fichiers audio sont envoyés au format *content parts* d'OpenAI. Des helpers construisent ces messages pour vous :
+
+```ts
+import { userMessage, imageFromFile, imageFromUrl, fileFromPath } from "@thegetget/get-agent";
+
 await agent.run([
-  userMessage("Que vois-tu ?", imageFromUrl("https://exemple.com/photo.jpg")),
-]);
-
-// Image locale (lue + encodée en base64 automatiquement, MIME déduit de l'extension)
-await agent.run([
-  userMessage("Décris cette capture.", await imageFromFile("./screenshot.png")),
-]);
-
-// Document local
-await agent.run([
-  userMessage("Résume ce document.", await fileFromPath("./rapport.pdf")),
-]);
-
-// Plusieurs pièces dans un même message
-await agent.run([
-  userMessage("Compare ces images.", await imageFromFile("./a.png"), await imageFromFile("./b.png")),
+  userMessage(
+    "Compare ces deux visuels avec le cahier des charges.",
+    await imageFromFile("./v1.png"),          // MIME déduit de l'extension
+    imageFromUrl("https://exemple.com/v2.jpg"),
+    await fileFromPath("./cahier-des-charges.pdf")
+  ),
 ]);
 ```
 
-Helpers disponibles : `text`, `imageFromUrl`, `imageFromBase64`, `imageFromBuffer`,
-`imageFromFile`, `fileFromBase64`, `fileFromBuffer`, `fileFromPath`, `fileFromId`,
-`toDataUrl`, et le constructeur `userMessage`.
+Helpers disponibles : `text`, `imageFromUrl`, `imageFromBase64`, `imageFromBuffer`, `imageFromFile`, `fileFromBase64`, `fileFromBuffer`, `fileFromPath`, `fileFromId`, `toDataUrl`, `userMessage`.
 
-> Nécessite un backend/modèle multimodal (vision). Le champ `Message.content` accepte
-> désormais `string | ContentPart[] | null`.
+### MCP
 
-### 4. Connexion aux Serveurs MCP (Model Context Protocol)
+Les serveurs [Model Context Protocol](https://modelcontextprotocol.io) (transport stdio) se connectent en parallèle à l'initialisation, et leurs outils sont exposés à l'agent comme des outils locaux.
 
-GetAgent se connecte automatiquement aux serveurs MCP configurés (via stdio) et expose leurs outils à l'agent.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
+```ts
 const agent = new Agent({
-  name: "AgentFichiers",
-  model: "Qwen3.5-9B.gguf",
+  name: "fichiers",
   mcpServers: [
     {
       name: "filesystem",
-      command: "node",
-      args: ["/chemin/vers/mcp-server-filesystem/dist/index.js", "/dossier/autorise"],
-    }
-  ]
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "./docs"],
+    },
+  ],
+  mcpStrict: true, // un serveur injoignable fait échouer initialize() (sinon : simple avertissement)
 });
 
-// L'agent utilise les outils fournis par le serveur MCP (ex: list_directory, read_file)
-const response = await agent.run("Quels sont les fichiers présents dans le dossier autorisé ?");
-console.log(response);
+console.log(await agent.run("Liste les fichiers Markdown du dossier."));
+await agent.shutdown(); // ferme les connexions MCP
 ```
 
-### 5. Skills — Modules Réutilisables
+Si deux serveurs exposent le même nom d'outil, celui du second est préfixé par le nom du serveur (`<serveur>_<outil>`).
 
-Un **Skill** regroupe un ensemble d'outils thématiques, un prompt système additionnel et des hooks de lifecycle (`initialize`/`shutdown`). Les noms des outils sont automatiquement préfixés par le nom du skill pour éviter les collisions.
+### Skills
 
-```typescript
-import { Agent, createTool, createSkill } from "@thegetget/get-agent";
-import { z } from "zod";
+Un skill regroupe des outils, des instructions ajoutées au prompt système et des hooks `initialize` / `shutdown`. Les noms de ses outils sont préfixés par le nom du skill (`math_calculer`), sauf avec `prefixToolNames: false`.
 
-// 1. Définir des outils
-const calculTool = createTool(
-  "calculate",
-  "Évalue une expression mathématique.",
-  z.object({ expression: z.string() }),
-  ({ expression }) => {
-    const result = Function(`"use strict"; return (${expression})`)();
-    return { result };
-  }
-);
+```ts
+import { createSkill } from "@thegetget/get-agent";
 
-const convertTool = createTool(
-  "convert_units",
-  "Convertit des unités (km/miles, kg/lbs, C/F).",
-  z.object({
-    value: z.number(),
-    from: z.string(),
-    to: z.string(),
-  }),
-  ({ value, from, to }) => {
-    const conversions: Record<string, Record<string, (v: number) => number>> = {
-      km: { miles: (v) => v * 0.621371 },
-      miles: { km: (v) => v * 1.60934 },
-      C: { F: (v) => (v * 9) / 5 + 32 },
-      F: { C: (v) => ((v - 32) * 5) / 9 },
-    };
-    return { result: conversions[from]?.[to]?.(value) ?? "Conversion non supportée" };
-  }
-);
-
-// 2. Regrouper dans un Skill
-const mathSkill = createSkill({
+const math = createSkill({
   name: "math",
-  description: "Outils de calcul et conversion d'unités",
-  tools: [calculTool, convertTool],
-  systemPrompt: "Utilise les outils math_calculate et math_convert_units pour répondre aux questions numériques.",
-  initialize: async () => console.log("✓ Math skill prêt"),
-  shutdown: async () => console.log("✓ Math skill nettoyé"),
+  description: "Calcul et conversions d'unités",
+  tools: [calculer, convertir],
+  systemPrompt: "Utilise les outils math_* pour tout calcul.",
+  initialize: async () => { /* ouvrir une connexion, charger un cache… */ },
+  shutdown: async () => { /* libérer les ressources */ },
 });
 
-// 3. Attacher le skill à un agent
-const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
-  skills: [mathSkill], // Les outils seront exposés comme "math_calculate" et "math_convert_units"
-});
+const agent = new Agent({ name: "assistant", skills: [math] });
 
-const response = await agent.run("Combien font 42 × 17, et convertis 100 km en miles ?");
-console.log(response);
-// → 42 × 17 = 714. 100 km ≈ 62.14 miles.
-
-await agent.shutdown(); // Appelle automatiquement le hook shutdown du skill
+await agent.addSkill(autreSkill);   // ajout à chaud
+await agent.removeSkill("math");    // retrait à chaud (appelle shutdown)
 ```
 
-### 6. Skills Dynamiques — Ajout et Suppression à Chaud
+### Multi-agents
 
-Les skills peuvent être ajoutés ou retirés à tout moment, même après l'initialisation de l'agent.
+`createAgentTool` expose un agent comme un outil, ce qui permet à un agent orchestrateur de déléguer des tâches à des agents spécialisés.
 
-```typescript
-import { Agent, createTool, createSkill } from "@thegetget/get-agent";
+```ts
+import { createAgentTool } from "@thegetget/get-agent";
+
+const traducteur = new Agent({
+  name: "traducteur",
+  systemPrompt: "Traduis fidèlement vers l'anglais. Réponds uniquement avec la traduction.",
+});
+
+const orchestrateur = new Agent({
+  name: "orchestrateur",
+  tools: [
+    createAgentTool(traducteur, {
+      name: "traduire_en_anglais",
+      description: "Traduit un texte français vers l'anglais.",
+      keepHistory: false, // historique du sous-agent réinitialisé à chaque appel (défaut)
+    }),
+  ],
+});
+```
+
+> [!WARNING]
+> Un agent ne doit pas être son propre outil : ses appels étant mis en file, il attendrait indéfiniment sa propre réponse.
+
+## Workflows
+
+Un `Workflow` est un graphe d'étapes qui partagent un état. Chaque étape reçoit l'état et renvoie une mise à jour partielle ; les arêtes, simples ou conditionnelles, choisissent l'étape suivante.
+
+```ts
+import { Workflow, END } from "@thegetget/get-agent";
 import { z } from "zod";
-
-const timeTool = createTool(
-  "current_time",
-  "Retourne la date et l'heure actuelle.",
-  z.object({}),
-  () => ({ timestamp: new Date().toISOString() })
-);
-
-const timeSkill = createSkill({
-  name: "time",
-  description: "Utilitaires de date et heure",
-  tools: [timeTool],
-  prefixToolNames: false, // Désactive le préfixe → l'outil reste "current_time"
-});
-
-const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
-});
-
-// Ajout dynamique
-await agent.addSkill(timeSkill);
-console.log(agent.getRegisteredSkills()); // [Skill { name: "time" }]
-console.log(agent.getRegisteredTools());  // [Tool { name: "current_time" }]
-
-// Utilisation
-const response = await agent.run("Quelle heure est-il ?");
-console.log(response);
-
-// Suppression à chaud (appelle le hook shutdown du skill)
-await agent.removeSkill("time");
-console.log(agent.getRegisteredTools()); // [] — les outils du skill ont été retirés
-
-await agent.shutdown();
-```
-
-### 7. Workflow Séquentiel
-
-Le cas le plus simple : une chaîne linéaire d'étapes exécutées dans l'ordre, reliées par `addEdge`.
-
-```typescript
-import { Workflow } from "@thegetget/get-agent";
-
-interface EtatPipeline {
-  donneesBrutes: string;
-  donneesNettoyees: string;
-  rapport: string;
-}
-
-const pipeline = new Workflow<EtatPipeline>({
-  name: "Pipeline ETL",
-  verbose: true,
-});
-
-pipeline
-  .addStep("extraire", async (state) => {
-    // Extraction des données depuis une source
-    return { donneesBrutes: "ligne1;ligne2;ligne3" };
-  })
-  .addStep("transformer", async (state) => {
-    // Nettoyage et transformation
-    const nettoyees = state.donneesBrutes.split(";").map(s => s.trim()).join(", ");
-    return { donneesNettoyees: nettoyees };
-  })
-  .addStep("charger", async (state) => {
-    // Génération du rapport final
-    return { rapport: `Données chargées : ${state.donneesNettoyees}` };
-  });
-
-// Chaîne linéaire : extraire -> transformer -> charger -> END
-pipeline
-  .setStart("extraire")
-  .addEdge("extraire", "transformer")
-  .addEdge("transformer", "charger")
-  .addEdge("charger", "END");
-
-const resultat = await pipeline.run({
-  donneesBrutes: "",
-  donneesNettoyees: "",
-  rapport: "",
-});
-
-console.log(resultat.rapport);
-```
-
-### 8. Workflow Conditionnel
-
-Utilisation de `addConditionalEdge` pour créer des branchements dynamiques basés sur l'état courant.
-
-```typescript
-import { Workflow } from "@thegetget/get-agent";
-
-interface EtatCommande {
-  commandeId: string;
-  panierValide: boolean;
-  stockDisponible: boolean;
-  status: string;
-}
-
-const workflow = new Workflow<EtatCommande>({
-  name: "Traitement Commande",
-  verbose: true,
-});
-
-workflow
-  .addStep("verifierPanier", async (state) => {
-    return { panierValide: true };
-  })
-  .addStep("verifierStock", async (state) => {
-    return { stockDisponible: true };
-  })
-  .addStep("confirmerCommande", async (state) => {
-    return { status: "CONFIRMÉE" };
-  })
-  .addStep("annulerCommande", async (state) => {
-    return { status: "ANNULÉE" };
-  });
-
-workflow
-  .setStart("verifierPanier")
-  // Branchement : panier valide -> vérifier stock, sinon -> annuler
-  .addConditionalEdge("verifierPanier", (state) => {
-    return state.panierValide ? "verifierStock" : "annulerCommande";
-  })
-  // Branchement : stock disponible -> confirmer, sinon -> annuler
-  .addConditionalEdge("verifierStock", (state) => {
-    return state.stockDisponible ? "confirmerCommande" : "annulerCommande";
-  })
-  .addEdge("confirmerCommande", "END")
-  .addEdge("annulerCommande", "END");
-
-const etatFinal = await workflow.run({
-  commandeId: "CMD-9876",
-  panierValide: false,
-  stockDisponible: false,
-  status: "INITIE"
-});
-
-console.log("Statut final :", etatFinal.status);
-```
-### 9. Workflow avec Agent IA
-
-Intégration d'un `Agent` au sein des étapes d'un workflow pour déléguer des tâches de raisonnement au LLM.
-
-```typescript
-import { Workflow, Agent } from "@thegetget/get-agent";
-
-interface EtatAnalyse {
-  texteOriginal: string;
-  resume: string;
-  sentiment: string;
-  traduction: string;
-}
-
-// Un seul agent polyvalent utilisé à chaque étape
-const agent = new Agent({
-  name: "Analyste",
-  systemPrompt: "Tu es un assistant d'analyse de texte. Réponds de manière concise.",
-  model: "Qwen3.5-9B.gguf",
-});
-
-const pipeline = new Workflow<EtatAnalyse>({
-  name: "Analyse de Texte",
-  verbose: true,
-});
-
-pipeline
-  .addStep("resumer", async (state) => {
-    const response = await agent.run(
-      `Résume le texte suivant en 2 phrases maximum :\n${state.texteOriginal}`
-    );
-    return { resume: String(response) };
-  })
-  .addStep("analyserSentiment", async (state) => {
-    const response = await agent.run(
-      `Quel est le sentiment général (positif, négatif ou neutre) de ce texte ?\n${state.resume}`
-    );
-    return { sentiment: String(response) };
-  })
-  .addStep("traduire", async (state) => {
-    const response = await agent.run(
-      `Traduis ce résumé en anglais :\n${state.resume}`
-    );
-    return { traduction: String(response) };
-  });
-
-pipeline
-  .setStart("resumer")
-  .addEdge("resumer", "analyserSentiment")
-  .addEdge("analyserSentiment", "traduire")
-  .addEdge("traduire", "END");
-
-const resultat = await pipeline.run({
-  texteOriginal: "L'intelligence artificielle transforme tous les secteurs. Les entreprises adoptent massivement ces technologies pour améliorer leur productivité et innover.",
-  resume: "",
-  sentiment: "",
-  traduction: "",
-});
-
-console.log("Résumé :", resultat.resume);
-console.log("Sentiment :", resultat.sentiment);
-console.log("Traduction :", resultat.traduction);
-```
-
-### 10. Workflow Multi-Agents (Boucle de feedback)
-
-Plusieurs agents autonomes coopèrent au sein d'un workflow avec une boucle de correction automatique.
-
-```typescript
-import { Workflow, Agent } from "@thegetget/get-agent";
-
-interface BlogState {
-  sujet: string;
-  draft: string;
-  feedback: string;
-  approuve: boolean;
-}
-
-const redacteur = new Agent({
-  name: "Redacteur",
-  systemPrompt: "Rédige des articles clairs et informatifs.",
-  model: "Qwen3.5-9B.gguf"
-});
-
-const correcteur = new Agent({
-  name: "Correcteur",
-  systemPrompt: "Recherche les faiblesses. Réponds par 'OK' si le texte est parfait, sinon donne des axes d'amélioration.",
-  model: "Qwen3.5-9B.gguf"
-});
-
-const workflow = new Workflow<BlogState>({
-  name: "Redaction Article",
-  verbose: true,
-});
-
-workflow
-  .addStep("rediger", async (state) => {
-    const prompt = `Rédige un article sur : ${state.sujet}.\nFeedback précédent : ${state.feedback}`;
-    const response = await redacteur.run(prompt);
-    return { draft: typeof response === "string" ? response : JSON.stringify(response) };
-  })
-  .addStep("reviser", async (state) => {
-    const prompt = `Valide l'article suivant :\n${state.draft}`;
-    const response = await correcteur.run(prompt);
-    const feedback = typeof response === "string" ? response : JSON.stringify(response);
-    return {
-      feedback,
-      approuve: feedback.toUpperCase().includes("OK")
-    };
-  });
-
-workflow
-  .setStart("rediger")
-  .addEdge("rediger", "reviser")
-  // Boucle : si rejeté, retour à la rédaction avec le feedback
-  .addConditionalEdge("reviser", (state) => {
-    return state.approuve ? "END" : "rediger";
-  });
-
-const etatFinal = await workflow.run({
-  sujet: "Les avantages du protocole MCP pour les agents IA",
-  draft: "",
-  feedback: "",
-  approuve: false
-});
-
-console.log("Article validé et publié !\n", etatFinal.draft);
-```
-
-### 10.1. Workflow Avancé — Parallélisme, Fiabilité, Reprise
-
-Le moteur de workflow propose des fonctions supplémentaires, toutes facultatives :
-
-```typescript
-import { z } from "zod";
-import { Workflow, END, FileCheckpointAdapter, WorkflowError } from "@thegetget/get-agent";
 
 const Etat = z.object({
-  avis: z.string(),
-  sentiment: z.string().optional(),
-  themes: z.array(z.string()).default([]),
-  synthese: z.string().default(""),
+  question: z.string(),
+  brouillon: z.string().default(""),
+  note: z.number().default(0),
+  tentatives: z.number().default(0),
 });
 
-// fromSchema : run() accepte le type d'entrée du schéma (les champs avec .default() sont facultatifs)
+const wf = Workflow.fromSchema(Etat, { name: "redaction", maxSteps: 12 })
+  .addStep("rediger", async (s) => ({
+    brouillon: await redacteur.run(s.question),
+    tentatives: s.tentatives + 1,
+  }))
+  .addStep("noter", async (s) => {
+    const { note } = await juge.run(s.brouillon, { schema: z.object({ note: z.number() }) });
+    return { note };
+  })
+  .setStart("rediger")
+  .addEdge("rediger", "noter")
+  .addConditionalEdge(
+    "noter",
+    (s) => (s.note >= 8 || s.tentatives >= 3 ? END : "rediger"),
+    ["rediger", END] // cibles possibles, vérifiées avant l'exécution
+  );
+
+const final = await wf.run({ question: "Explique l'intérêt des agents IA en entreprise." });
+```
+
+`Workflow.fromSchema` déduit les types de l'état à partir du schéma : les champs qui ont un `.default()` deviennent facultatifs en entrée. `new Workflow<Etat>({ ... })` reste disponible si vous préférez déclarer le type vous-même.
+
+Le graphe est vérifié au premier `run()` : une étape de départ manquante ou une arête vers une étape inexistante est signalée **avant** d'exécuter la moindre étape.
+
+### Étapes parallèles
+
+Les branches d'une étape parallèle s'exécutent en même temps, sur une copie figée de l'état. Leurs mises à jour sont ensuite fusionnées : si deux branches écrivent la même clé, c'est une erreur, sauf si vous fournissez une fonction `merge`. Quand une branche échoue, le `signal` des autres est annulé.
+
+```ts
+wf.addParallelStep("analyser", {
+  sentiment: async (s, ctx) => ({ sentiment: await classer(s.avis, ctx.signal) }),
+  themes: async (s) => ({ themes: await extraireThemes(s.avis) }),
+});
+```
+
+### Retry, timeout et annulation
+
+```ts
+wf.addStep("appeler_api", appelerApi, { retries: 2, retryDelayMs: 1_000, timeoutMs: 30_000 });
+
+const controller = new AbortController();
+await wf.run(etat, { signal: controller.signal });
+```
+
+Chaque étape reçoit un contexte `ctx` : `{ signal, step, stepCount, attempt, branch? }`. Transmettez `ctx.signal` à vos appels (`agent.run(prompt, { signal: ctx.signal })`) pour qu'un timeout ou une annulation les interrompe réellement.
+
+### Observabilité
+
+```ts
 const wf = Workflow.fromSchema(Etat, {
-  name: "Analyse",
-  strict: true,                 // chaque étape doit avoir une arête sortante ; état figé dans les étapes
-  validate: "each-step",        // ou "end" (Zod seulement au début et à la fin) ou "none"
+  name: "redaction",
+  hooks: {
+    onStepStart: (step, state) => {},
+    onStepEnd: (step, { update, state, durationMs, attempts }) => {},
+    onError: (step, error, state) => {},
+  },
+});
+
+const { state, trace } = await wf.runWithTrace(etat);
+// trace : [{ step, durationMs, attempts, update, next }, …]
+```
+
+Les erreurs sont des `WorkflowError` : elles indiquent l'étape (`step`), le nombre d'étapes déjà exécutées (`stepCount`), l'état à cet instant (`state`) et l'erreur d'origine (`cause`).
+
+### Checkpoints et reprise
+
+Avec un adaptateur de checkpoint et un `runId`, l'état est sauvegardé après chaque étape. Un run interrompu (plantage, redémarrage, panne réseau) reprend à la première étape non terminée.
+
+```ts
+import { FileCheckpointAdapter } from "@thegetget/get-agent";
+
+const wf = Workflow.fromSchema(Etat, {
+  name: "redaction",
   checkpoint: new FileCheckpointAdapter(".workflow-checkpoints"),
-  hooks: { onStepEnd: (step, { durationMs }) => console.log(step, durationMs) },
 });
 
-wf
-  // Les branches s'exécutent en même temps sur un instantané de l'état, puis leurs mises à jour sont fusionnées
-  .addParallelStep("analyser", {
-    sentiment: async (s, ctx) => ({ sentiment: await classer(s.avis, ctx.signal) }),
-    themes: async (s) => ({ themes: await extraireThemes(s.avis) }),
-  }, { retries: 1, timeoutMs: 60_000 })
-  .addStep("synthese", async (s) => ({ synthese: `${s.sentiment} : ${s.themes.join(", ")}` }))
-  .setStart("analyser")
-  .addEdge("analyser", "synthese")
-  .addEdge("synthese", END);
+await wf.run(etat, { runId: "commande-1234" });
 
-try {
-  const { state, trace } = await wf.runWithTrace({ avis: "…" }, { runId: "avis-42", signal });
-} catch (err) {
-  if (err instanceof WorkflowError) console.error(err.step, err.state, err.cause);
-  const repris = await wf.resume("avis-42"); // reprend à la première étape non terminée
-}
+// plus tard, éventuellement dans un autre processus :
+const { state } = await wf.resume("commande-1234");
 ```
 
-| Fonction | Détail |
-| --- | --- |
-| Validation du graphe | `validate()` est appelé automatiquement avant le premier run : étape de départ, cibles des arêtes, cibles déclarées des conditions. Un graphe invalide échoue **avant** d'exécuter la moindre étape. Les étapes inatteignables sont signalées par un `warn`. |
-| `END` | Constante exportée (`"END"`, l'alias `"__end__"` reste accepté). Ces noms ne peuvent pas servir de nom d'étape. |
-| `addConditionalEdge(from, fn, targets?)` | Si `targets` est fourni, les cibles sont vérifiées au démarrage, et une valeur renvoyée hors de cette liste lève une erreur qui nomme l'étape source. |
-| `addParallelStep(name, branches, opts?)` | Branches exécutées avec `Promise.all`. Si deux branches écrivent la même clé, c'est une erreur, sauf si `opts.merge(updates, state)` est fourni. Quand une branche échoue, le `signal` des autres est annulé. |
-| Options d'étape | `{ retries, retryDelayMs, timeoutMs }` sur `addStep` / `addParallelStep`. Chaque étape reçoit `ctx = { signal, step, stepCount, attempt, branch? }`. |
-| `run(state, { signal, runId })` | `signal` interrompt le workflow. `runId` active la sauvegarde d'un checkpoint après chaque étape. |
-| `runWithTrace()` | Renvoie `{ state, trace }`, où `trace` liste pour chaque étape `step`, `durationMs`, `attempts`, `update` et `next`. |
-| `resume(runId)` | Reprend depuis le dernier checkpoint (`MemoryCheckpointAdapter`, `FileCheckpointAdapter`, ou votre propre `CheckpointAdapter`). L'état doit être sérialisable en JSON. |
-| `WorkflowError` | Porte `workflow`, `step`, `stepCount`, `state` et `cause` (l'erreur d'origine). |
-| `strict` | Une étape sans arête sortante devient une erreur, et l'état passé aux étapes est figé (`Object.freeze`). En dehors du mode strict, ne modifiez pas `state` directement : renvoyez une mise à jour. |
+Deux adaptateurs sont fournis, `MemoryCheckpointAdapter` et `FileCheckpointAdapter`. Pour stocker ailleurs (Redis, Postgres…), implémentez l'interface `CheckpointAdapter` (`save`, `load`, `clear`). L'état doit être sérialisable en JSON.
 
-> Les clés renvoyées par une étape mais absentes du `stateSchema` sont supprimées par Zod. Un `warn` les liste.
-> Un `timeoutMs` fait échouer l'étape et annule `ctx.signal`. Une étape qui ignore ce signal continue de s'exécuter en arrière-plan.
+### Options du workflow
 
-### 11. Streaming (Réponse en Temps Réel)
-
-`agent.runStream()` renvoie un `AsyncGenerator` qui diffuse la réponse finale token par token. Les appels d'outils sont gérés en interne et de façon transparente : seul le texte final est émis.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
-const agent = new Agent({
-  name: "Conteur",
-  systemPrompt: "Tu es un conteur captivant.",
-  model: "Qwen3.5-9B.gguf",
-  showThinking: false, // Masque les blocs <think> du flux
-});
-
-// Itère sur les fragments au fur et à mesure de leur génération
-for await (const chunk of agent.runStream("Raconte une courte histoire sur un robot curieux.")) {
-  process.stdout.write(chunk);
-}
-```
-
-### 12. Streaming + Sortie Structurée
-
-`runStreamStructured()` combine le streaming et la validation Zod : on itère le `stream` pour l'affichage temps réel, et on `await` le `result` pour récupérer l'objet typé et validé.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-import { z } from "zod";
-
-const agent = new Agent({ name: "Extracteur", model: "Qwen3.5-9B.gguf" });
-
-const schema = z.object({
-  titre: z.string(),
-  motsCles: z.array(z.string()),
-});
-
-const { stream, result } = agent.runStreamStructured(
-  "Génère un titre et des mots-clés pour un article sur les agents IA.",
-  { schema, maxRetries: 2 }
-);
-
-// Affichage temps réel
-for await (const chunk of stream) {
-  process.stdout.write(chunk);
-}
-
-// Objet final validé
-const data = await result;
-console.log("\n\nObjet validé :", data);
-```
-
-### 13. REPL Interactif
-
-`agent.repl()` lance une boucle interactive dans le terminal. Commandes intégrées : `/exit`, `/clear`, `/usage`, `/tools`, `/help`.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
-const agent = new Agent({
-  name: "mon-agent",
-  systemPrompt: "Tu es un assistant utile.",
-  model: "Qwen3.5-9B.gguf",
-});
-
-// stream: true pour afficher les réponses en temps réel
-await agent.repl({ stream: true, prompt: "Vous" });
-```
-
-### 14. Hooks / Middleware
-
-Les **hooks** permettent d'observer et d'intercepter le cycle de vie de l'agent. Tous sont optionnels et peuvent être asynchrones.
-
-| Hook | Signature | Effet du retour |
+| Option | Défaut | Description |
 | --- | --- | --- |
-| `beforeLLMCall` | `(messages) => Message[] \| void` | Remplace les messages envoyés au LLM (ou `void` pour les garder). |
-| `afterLLMCall` | `(content, toolCalls?) => void` | Observation uniquement (audit, logs). |
-| `beforeToolCall` | `(toolName, args) => any \| false` | `false` annule l'appel ; un objet remplace les arguments ; `void`/`true` poursuit. |
-| `afterToolCall` | `(toolName, args, result) => any` | Une valeur retournée remplace le résultat de l'outil. |
+| `stateSchema` | — | Schéma Zod de l'état (fourni automatiquement par `fromSchema`). |
+| `validate` | `"each-step"` | Quand valider l'état : `"each-step"`, `"end"` (au début et à la fin seulement) ou `"none"`. |
+| `strict` | `false` | Chaque étape doit avoir une arête sortante, et l'état passé aux étapes est figé (`Object.freeze`). |
+| `maxSteps` | `100` | Nombre maximal d'étapes exécutées, pour se protéger des boucles infinies. |
+| `hooks` | — | `onStepStart`, `onStepEnd`, `onError`. |
+| `checkpoint` | — | Adaptateur de persistance pour `run(…, { runId })` et `resume()`. |
+| `logger` / `verbose` | — | Journalisation (voir [Logs](#logs)). |
 
-```typescript
-import { Agent, createTool, AgentHooks } from "@thegetget/get-agent";
-import { z } from "zod";
+> [!TIP]
+> Ne modifiez pas `state` directement dans une étape : renvoyez une mise à jour. Les clés absentes du schéma sont supprimées par Zod, et un avertissement les liste.
 
-const weatherTool = createTool(
-  "get_weather",
-  "Retourne la météo simulée pour une ville.",
-  z.object({ city: z.string() }),
-  async ({ city }) => ({ city, temperature: 21, condition: "Ensoleillé" })
-);
+## En production
 
-const hooks: AgentHooks = {
-  beforeLLMCall: (messages) => {
-    console.log(`[hook] ${messages.length} messages envoyés au LLM`);
-    return messages;
-  },
-  afterLLMCall: (content, toolCalls) => {
-    if (toolCalls?.length) console.log(`[hook] outils demandés : ${toolCalls.map(t => t.function.name).join(", ")}`);
-  },
-  beforeToolCall: (toolName, args) => {
-    // Normalise / valide les arguments avant exécution
-    if (toolName === "get_weather") args.city = args.city.trim();
-    return args;
-  },
-  afterToolCall: (toolName, _args, result) => {
-    // Enrichit le résultat retourné au LLM
-    return { ...result, source: "weather-api" };
-  },
-};
+### Hooks
 
+Les hooks interceptent le cycle de vie de l'agent. Tous sont facultatifs et peuvent être asynchrones.
+
+| Hook | Effet de la valeur renvoyée |
+| --- | --- |
+| `beforeLLMCall(messages)` | Un tableau remplace les messages envoyés au LLM. |
+| `afterLLMCall(content, toolCalls?)` | Aucun (observation : audit, métriques). |
+| `beforeToolCall(name, args)` | `false` annule l'appel ; un objet remplace les arguments. |
+| `afterToolCall(name, args, result)` | Une valeur remplace le résultat de l'outil. |
+
+```ts
 const agent = new Agent({
-  name: "hooked-agent",
-  model: "Qwen3.5-9B.gguf",
-  tools: [weatherTool],
-  hooks,
+  name: "assistant",
+  tools: [meteo],
+  hooks: {
+    beforeToolCall: (name, args) => (name === "meteo" ? { ...args, ville: args.ville.trim() } : undefined),
+    afterToolCall: (_name, _args, result) => ({ ...result, source: "api-meteo" }),
+  },
 });
-
-console.log(await agent.run("Quelle est la météo à Paris ?"));
 ```
 
-### 15. Human-in-the-Loop (Approbation d'Outils)
+### Approbation humaine
 
-Marquez un outil comme sensible avec `requiresApproval = true`. Avant son exécution, l'agent appelle le callback `onApprovalRequired` : retournez `true` pour autoriser, `false` pour annuler.
+Un outil marqué `requiresApproval` n'est exécuté qu'après validation par le callback `onApprovalRequired`. Un refus est transmis au modèle, qui peut adapter sa réponse.
 
-```typescript
-import { Agent, createTool } from "@thegetget/get-agent";
-import { z } from "zod";
-
-const deleteFileTool = createTool(
-  "delete_file",
-  "Supprime définitivement un fichier.",
-  z.object({ path: z.string() }),
-  async ({ path }) => ({ success: true, deleted: path })
-);
-
-// Marque l'outil comme nécessitant une approbation humaine
-deleteFileTool.requiresApproval = true;
+```ts
+const supprimer = createTool("supprimer_fichier", "Supprime un fichier.", z.object({ path: z.string() }), rm);
+supprimer.requiresApproval = true;
 
 const agent = new Agent({
-  name: "file-manager",
-  systemPrompt: "Tu aides à gérer des fichiers.",
-  model: "Qwen3.5-9B.gguf",
-  tools: [deleteFileTool],
-
-  // Appelé juste avant l'exécution de tout outil avec requiresApproval = true
-  onApprovalRequired: async (toolName, args) => {
-    console.log(`Approbation requise : ${toolName}(${JSON.stringify(args)})`);
-    // Ici : demander une confirmation (readline, UI, webhook...). On simule un refus.
-    return false;
-  },
+  name: "gestionnaire",
+  tools: [supprimer],
+  onApprovalRequired: async (tool, args) => demanderConfirmation(`${tool}(${JSON.stringify(args)})`),
 });
-
-const response = await agent.run("Supprime le fichier /data/backup.sql.");
-console.log(response); // L'agent reçoit { cancelled: true } et adapte sa réponse
 ```
 
-### 16. Agent comme Outil (Sous-Agents)
+### Guardrails
 
-`createAgentTool` encapsule un `Agent` en tant qu'outil, permettant à un agent « orchestrateur » de déléguer des tâches à des agents spécialisés.
+Les guardrails filtrent l'entrée de l'utilisateur et la réponse finale. Chacun peut **bloquer** (le run lève une erreur) ou **assainir** (le texte est transformé).
 
-```typescript
-import { Agent, createAgentTool } from "@thegetget/get-agent";
-
-// Agent spécialisé
-const traducteur = new Agent({
-  name: "Traducteur",
-  systemPrompt: "Tu traduis fidèlement vers l'anglais. Réponds uniquement avec la traduction.",
-  model: "Qwen3.5-9B.gguf",
-});
-
-// On l'expose comme un outil
-const traducteurTool = createAgentTool(traducteur, {
-  name: "traduire_en_anglais",
-  description: "Traduit un texte français vers l'anglais.",
-  keepHistory: false, // Réinitialise l'historique du sous-agent à chaque appel (défaut)
-});
-
-// Agent orchestrateur
-const assistant = new Agent({
-  name: "Assistant",
-  systemPrompt: "Tu es un assistant. Utilise tes outils quand c'est pertinent.",
-  model: "Qwen3.5-9B.gguf",
-  tools: [traducteurTool],
-});
-
-console.log(await assistant.run("Traduis 'Bonjour le monde' en anglais."));
-```
-
-### 17. Budget & Suivi de Consommation
-
-Limitez la consommation par session (tokens ou coût USD) et consultez l'usage cumulé. Si une limite est franchie, `run()` lève une erreur.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
+```ts
+import { maxLength, blockedPatterns, redactPII, sanitize } from "@thegetget/get-agent";
 
 const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
-  budget: {
-    maxTokens: 100_000,   // Plafond de tokens pour la session
-    maxCostUSD: 0.50,     // Plafond de coût (nécessite pricing)
-    pricing: {
-      inputPerMToken: 0.15,   // Prix par million de tokens d'entrée
-      outputPerMToken: 0.60,  // Prix par million de tokens de sortie
-    },
-  },
-});
-
-await agent.run("Explique le protocole MCP en une phrase.");
-
-// Récupère la consommation cumulée + coût estimé
-const usage = agent.getUsage();
-console.log(usage);
-// { totalPromptTokens, totalCompletionTokens, totalTokens, llmCallCount, estimatedCostUSD }
-
-agent.clearUsage(); // Réinitialise les compteurs
-```
-
-### 18. Guardrails (Filtres d'Entrée / Sortie)
-
-Les **guardrails** filtrent l'entrée utilisateur avant le LLM et/ou la réponse finale avant qu'elle soit renvoyée. Un guardrail peut **bloquer** (lève une erreur) ou **assainir** (transforme le texte). Helpers fournis : `maxLength`, `blockedPatterns`, `sanitize`, `redactPII`.
-
-```typescript
-import { Agent, maxLength, blockedPatterns, redactPII, sanitize } from "@thegetget/get-agent";
-
-const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
+  name: "assistant",
   guardrails: {
-    input: [
-      maxLength(2000),                          // Bloque les entrées trop longues
-      blockedPatterns([/mot-interdit/i]),       // Bloque certains motifs
-      redactPII(),                              // Masque emails / téléphones / cartes
-    ],
-    output: [
-      sanitize((t) => t.replace(/\bAPI_KEY=\S+/g, "API_KEY=[REDACTED]")), // Nettoie la sortie
-    ],
+    input: [maxLength(4_000), blockedPatterns([/ignore (all )?previous instructions/i]), redactPII()],
+    output: [sanitize((t) => t.replace(/sk-[\w-]{20,}/g, "[REDACTED]"))],
+  },
+});
+```
+
+En streaming, les guardrails de sortie s'appliquent au texte complet, une fois le flux terminé.
+
+### Budget et consommation
+
+```ts
+const agent = new Agent({
+  name: "assistant",
+  budget: {
+    maxTokens: 100_000,
+    maxCostUSD: 0.5,
+    pricing: { inputPerMToken: 0.15, outputPerMToken: 0.6 },
   },
 });
 
-// Une entrée bloquée lève une erreur ; une entrée assainie est transformée silencieusement.
-console.log(await agent.run("Contacte-moi à jean.dupont@example.com"));
+await agent.run("…");
+agent.getUsage(); // { totalPromptTokens, totalCompletionTokens, totalTokens, llmCallCount, estimatedCostUSD }
 ```
 
-### 19. Persistance de l'Historique
+Dès qu'un plafond est atteint, le run lève une erreur `[Budget]`. Les tentatives de correction de sortie structurée sont comptées dans la consommation.
 
-Avec un `historyAdapter` et un `sessionId`, l'agent charge l'historique au démarrage et le sauvegarde après chaque `run()` — idéal pour des conversations reprises entre exécutions. `FileHistoryAdapter` stocke un fichier JSON par session.
+### Persistance de l'historique
 
-```typescript
-import { Agent, FileHistoryAdapter } from "@thegetget/get-agent";
+```ts
+import { FileHistoryAdapter } from "@thegetget/get-agent";
 
 const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
-  historyAdapter: new FileHistoryAdapter(".agent-history"), // <dir>/<sessionId>.json
-  sessionId: "user-42",
+  name: "assistant",
+  historyAdapter: new FileHistoryAdapter(".agent-history"), // un fichier JSON par session
+  sessionId: "utilisateur-42",
 });
-
-// Premier lancement
-await agent.run("Je m'appelle Gaëtan.");
-
-// Lors d'une exécution ultérieure (même sessionId), l'agent se souvient du contexte
-const response = await agent.run("Quel est mon prénom ?");
-console.log(response); // → "Gaëtan"
 ```
 
-> Vous pouvez implémenter l'interface `HistoryAdapter` (`load`, `save`, `clear`) pour persister vers une base de données ou un cache.
+L'historique est chargé à l'initialisation et sauvegardé après chaque run. Pour utiliser une base de données ou un cache, implémentez l'interface `HistoryAdapter` (`load`, `save`, `clear`).
 
-### 20. Logger Structuré
+### Fiabilité et annulation
 
-Configurez la journalisation avec des niveaux (`debug`, `info`, `warn`, `error`), un format `text` ou `json`, ou un transport personnalisé (envoi vers un service de logs). La config `logger` prend le pas sur `verbose`.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
+```ts
 const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
-  logger: {
-    level: "debug",
-    format: "json", // Logs structurés JSON, parfaits pour l'agrégation
-    // transport: (entry) => myLogService.send(entry), // Transport sur mesure (override le format)
-  },
-});
-
-await agent.run("Bonjour !");
-```
-
-### 21. Retries & Exécution Parallèle des Outils
-
-GetAgent réessaie automatiquement les appels LLM en échec (backoff exponentiel) et peut exécuter en parallèle plusieurs outils demandés dans une même itération.
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
-const agent = new Agent({
-  name: "Assistant",
-  model: "Qwen3.5-9B.gguf",
-  parallelTools: true, // Exécute en parallèle les appels d'outils indépendants
+  name: "assistant",
   retry: {
-    maxRetries: 3,                                 // Tentatives après l'échec initial
-    initialDelayMs: 500,                           // Délai initial avant le 1er retry
-    maxDelayMs: 10_000,                            // Délai max entre deux retries
-    retryableStatuses: [429, 500, 502, 503, 504],  // Codes HTTP déclenchant un retry
+    maxRetries: 3,          // tentatives supplémentaires après l'échec initial
+    initialDelayMs: 500,    // backoff exponentiel avec jitter
+    maxDelayMs: 10_000,
+    timeoutMs: 30_000,      // par tentative (en streaming : jusqu'à la réception des en-têtes)
   },
-});
-
-console.log(await agent.run("Compare la météo de Paris et de Lyon."));
-```
-
-### 22. Timeout, Annulation & Fenêtre de Contexte
-
-```typescript
-import { Agent } from "@thegetget/get-agent";
-
-const agent = new Agent({
-  name: "Assistant",
-  retry: { timeoutMs: 30_000 },      // timeout par tentative (en streaming : jusqu'aux en-têtes de réponse)
   context: {
-    maxMessages: 40,                 // n'envoie au LLM que les 40 derniers messages (+ le prompt système)
-    maxToolResultChars: 20_000,      // tronque les résultats d'outils trop longs dans l'historique
+    maxMessages: 40,           // ne transmet au LLM que les 40 derniers messages (+ prompt système)
+    maxToolResultChars: 20_000 // tronque les résultats d'outils volumineux
   },
-  toolCallFormat: "auto",            // "native" | "lfm" | "auto" (LFM détecté via le nom du modèle)
-  mcpStrict: false,                  // true : un serveur MCP injoignable fait échouer initialize()
 });
 
 const controller = new AbortController();
-setTimeout(() => controller.abort(), 5_000);
-await agent.run("Question longue…", { signal: controller.signal });
-for await (const chunk of agent.runStream("…", { signal: controller.signal })) process.stdout.write(chunk);
+await agent.run("…", { signal: controller.signal });
 ```
 
-- Le code `429` respecte l'en-tête `Retry-After`. Une annulation demandée par l'appelant n'est jamais retentée.
-- `context.maxMessages` ne modifie pas l'historique stocké. Il ne sépare jamais un appel d'outil de son résultat.
-- **Concurrence :** les appels `run` / `runStream` sur une **même instance** sont mis en file et exécutés l'un après l'autre, car ils partagent l'historique. Un agent ne doit pas s'appeler lui-même comme outil, sinon il reste bloqué indéfiniment (interblocage).
-- **Guardrails de sortie en streaming :** ils s'appliquent au texte complet une fois le flux terminé. Un blocage lève une erreur après la diffusion, et `sanitized` ne peut pas s'appliquer.
+- Les codes 429 et 5xx ainsi que les erreurs réseau sont retentés, et l'en-tête `Retry-After` est respecté. Une annulation demandée par l'appelant n'est jamais retentée.
+- `context.maxMessages` réduit uniquement ce qui est envoyé au LLM : l'historique stocké reste complet, et un appel d'outil n'est jamais séparé de son résultat.
 
----
+### Logs
 
-## Référence de Configuration (`AgentConfig`)
+```ts
+const agent = new Agent({
+  name: "assistant",
+  logger: {
+    level: "info",                            // debug | info | warn | error
+    format: "json",                           // text | json
+    transport: (entry) => monService.log(entry), // remplace la sortie console
+  },
+});
+```
+
+`verbose: true` est un raccourci pour obtenir les logs `debug` sur la console.
+
+## Référence API
+
+### `new Agent(config)`
 
 | Option | Type | Défaut | Description |
 | --- | --- | --- | --- |
-| `name` | `string` | — (requis) | Nom de l'agent. |
-| `systemPrompt` | `string` | `"You are a helpful AI assistant."` | Prompt système de base. |
-| `model` | `string` | `"Qwen3.5-9B.gguf"` | Nom du modèle. |
-| `baseUrl` | `string` | URL interne par défaut | URL de l'API compatible OpenAI. |
-| `apiKey` | `string` | `"no-key"` | Clé API (facultative pour un backend local). |
-| `tools` | `Tool[]` | `[]` | Outils locaux exposés à l'agent. |
-| `skills` | `Skill[]` | `[]` | Skills attachés à l'agent. |
-| `mcpServers` | `McpServerConfig[]` | `[]` | Serveurs MCP à connecter (stdio). |
-| `maxIterations` | `number` | `10` | Nombre max d'itérations de la boucle agent. |
+| `name` | `string` | **requis** | Nom de l'agent (utilisé dans les logs). |
+| `model` | `string` | `""` | Nom du modèle envoyé à l'API. |
+| `baseUrl` | `string` | `"http://127.0.0.1:8080/v1"` | URL d'une API compatible OpenAI. |
+| `apiKey` | `string` | — | Clé envoyée en `Authorization: Bearer`. |
+| `systemPrompt` | `string` | `"You are a helpful AI assistant."` | Prompt système. Les prompts des skills y sont ajoutés. |
 | `temperature` | `number` | `0.2` | Température d'échantillonnage. |
-| `showThinking` | `boolean` | `true` | Affiche/conserve les blocs `<think>`. |
-| `hooks` | `AgentHooks` | `{}` | Hooks de cycle de vie (voir §14). |
-| `onApprovalRequired` | `(toolName, args) => Promise<boolean>` | — | Callback d'approbation (voir §15). |
-| `budget` | `BudgetConfig` | — | Plafonds de tokens/coût et pricing (voir §17). |
-| `guardrails` | `Guardrails` | — | Filtres d'entrée/sortie (voir §18). |
-| `historyAdapter` | `HistoryAdapter` | — | Persistance de l'historique (voir §19). |
-| `sessionId` | `string` | — | Identifiant de session (requis avec `historyAdapter`). |
-| `logger` | `LoggerConfig` | — | Journalisation structurée (voir §20). |
-| `retry` | `RetryConfig` | voir §21 | Stratégie de retry des appels LLM. |
-| `parallelTools` | `boolean` | `false` | Exécution parallèle des outils. |
-| `toolCallFormat` | `"native" \| "lfm" \| "auto"` | `"auto"` | Mode d'échange des appels d'outils (voir §22). |
-| `context` | `ContextConfig` | — | `maxMessages`, `maxToolResultChars` (voir §22). |
-| `mcpStrict` | `boolean` | `false` | Fait échouer `initialize()` si un serveur MCP est injoignable. |
-| `verbose` | `boolean` | `false` | Logs de debug sur la console. |
+| `maxIterations` | `number` | `10` | Nombre maximal de tours LLM ↔ outils par run. |
+| `tools` | `Tool[]` | `[]` | Outils locaux. |
+| `skills` | `Skill[]` | `[]` | Skills. |
+| `mcpServers` | `McpServerConfig[]` | `[]` | Serveurs MCP (stdio). |
+| `mcpStrict` | `boolean` | `false` | Fait échouer l'initialisation si un serveur MCP est injoignable. |
+| `parallelTools` | `boolean` | `false` | Exécute en parallèle les outils demandés dans un même tour. |
+| `toolCallFormat` | `"auto" \| "native" \| "lfm"` | `"auto"` | `"lfm"` ajoute la liste des outils au prompt système (modèles LiquidAI). |
+| `showThinking` | `boolean` | `true` | Conserve les blocs `<think>` dans la sortie. |
+| `hooks` | `AgentHooks` | — | Voir [Hooks](#hooks). |
+| `onApprovalRequired` | `(tool, args) => Promise<boolean>` | — | Voir [Approbation humaine](#approbation-humaine). |
+| `guardrails` | `{ input?, output? }` | — | Voir [Guardrails](#guardrails). |
+| `budget` | `BudgetConfig` | — | Voir [Budget](#budget-et-consommation). |
+| `retry` | `RetryConfig` | voir [Fiabilité](#fiabilité-et-annulation) | Retries, backoff et timeout des appels LLM. |
+| `context` | `ContextConfig` | — | Limite les messages envoyés et la taille des résultats d'outils. |
+| `historyAdapter` / `sessionId` | `HistoryAdapter` / `string` | — | Voir [Historique](#persistance-de-lhistorique). |
+| `logger` / `verbose` | `LoggerConfig` / `boolean` | `warn` | Voir [Logs](#logs). |
 
-### Principales méthodes de `Agent`
+### Méthodes de `Agent`
 
 | Méthode | Description |
 | --- | --- |
-| `run(input, structuredConfig? \| { signal })` | Exécute la boucle agent ; renvoie un texte ou un objet validé. |
-| `runStream(input, { signal }?)` | Diffuse la réponse finale token par token (`AsyncGenerator`). |
-| `runStreamStructured(input, config)` | `{ stream, result }` : flux + objet validé. |
-| `repl(options?)` | Lance une session interactive en terminal. |
-| `addSkill(skill)` / `removeSkill(name)` | Gestion dynamique des skills. |
-| `getRegisteredTools()` / `getRegisteredSkills()` | Inspection des capacités enregistrées. |
-| `getHistory()` / `clearHistory()` | Lecture / réinitialisation de l'historique. |
-| `getUsage()` / `clearUsage()` | Suivi / réinitialisation de la consommation. |
-| `initialize()` / `shutdown()` | Connexion / nettoyage (MCP, skills). |
+| `run(input, options?)` | Exécute la boucle agent. Avec `{ schema }`, renvoie un objet validé ; accepte aussi `{ signal }`. |
+| `runStream(input, options?)` | `AsyncGenerator<string>` du texte de la réponse. |
+| `runStreamStructured(input, config)` | `{ stream, result }` : texte diffusé, puis objet validé. |
+| `repl(options?)` | Session interactive dans le terminal (`/exit`, `/clear`, `/usage`, `/tools`, `/help`). |
+| `initialize()` / `shutdown()` | Connexion et libération des ressources (MCP, skills). `initialize()` est appelé automatiquement au premier run. |
+| `addSkill(skill)` / `removeSkill(name)` | Ajout et retrait de skills à chaud. |
+| `getRegisteredTools()` / `getRegisteredSkills()` | Outils et skills disponibles. |
+| `getHistory()` / `clearHistory()` | Lecture et réinitialisation de l'historique. |
+| `getUsage()` / `clearUsage()` | Consommation cumulée et coût estimé. |
 
----
+### Méthodes de `Workflow`
+
+| Méthode | Description |
+| --- | --- |
+| `Workflow.fromSchema(schema, config)` | Crée un workflow typé à partir d'un schéma Zod. |
+| `addStep(name, fn, options?)` | Ajoute une étape ; `options` : `{ retries, retryDelayMs, timeoutMs }`. |
+| `addParallelStep(name, branches, options?)` | Ajoute une étape dont les branches s'exécutent en parallèle ; `options.merge` est facultatif. |
+| `addEdge(from, to)` | Transition fixe (`to` peut valoir `END`). |
+| `addConditionalEdge(from, fn, targets?)` | Transition calculée à partir de l'état. |
+| `setStart(name)` | Définit l'étape de départ. |
+| `validate()` | Vérifie le graphe (appelé automatiquement au premier run). |
+| `run(state, { signal?, runId? })` | Exécute le workflow et renvoie l'état final. |
+| `runWithTrace(state, options?)` | Renvoie `{ state, trace }`. |
+| `resume(runId, { signal? })` | Reprend un run depuis son dernier checkpoint. |
+
+### Bas niveau
+
+`LLMClient` (client HTTP avec retries), `McpManager`, `StreamTagParser` (analyse incrémentale du texte streamé) et `extractToolCalls` sont exportés pour construire vos propres boucles.
+
+## Exemples
+
+Le dossier [`examples/`](./examples) contient 15 scripts exécutables avec `npx tsx examples/<fichier>.ts` :
+
+| Thème | Exemples |
+| --- | --- |
+| Bases | [chat et sortie structurée](./examples/01_chat_et_sortie_structuree.ts), [outils](./examples/02_outils.ts), [conversation](./examples/11_chat_conversation.ts), [multimodal](./examples/14_multimodal.ts) |
+| Extensions | [skills](./examples/03_skills.ts), [MCP](./examples/04_mcp.ts), [multi-agents](./examples/09_multi_agents.ts) |
+| Workflows | [graphe d'étapes](./examples/05_workflow.ts), [scoring](./examples/13_scoring_workflow.ts), [parallèle, checkpoints, reprise](./examples/15_workflow_avance.ts) |
+| Production | [streaming et REPL](./examples/06_streaming_et_repl.ts), [hooks](./examples/07_hooks.ts), [approbation humaine](./examples/08_human_in_the_loop.ts), [guardrails, budget, logs, persistance](./examples/10_production.ts), [LLM-as-judge](./examples/12_scoring_reponses.ts) |
 
 ## Développement
 
 ```bash
 npm install
-npm run typecheck   # vérification des types (src + tests)
-npm test            # suite Vitest (fetch simulé, aucun LLM requis)
-npm run build       # compilation vers dist/ (JS lisible + .d.ts + source maps)
+npm run typecheck   # vérification des types (src et tests)
+npm test            # tests Vitest : fetch simulé, aucun LLM requis
+npm run build       # dist/ : JS, déclarations .d.ts et source maps
 ```
 
-## Changements de comportement (1.1.0)
-
-- Le niveau de log par défaut passe de `error` à `warn`, pour que les échecs de connexion MCP soient visibles.
-- Le résultat d'un outil MCP est aplati : le texte est joint, `structuredContent` est renvoyé tel quel, et `isError` devient une erreur. Avant, c'était l'objet `CallToolResult` brut.
-- Deux serveurs MCP qui exposent le même nom d'outil : celui du second est préfixé `<serveur>_`.
-- `runStreamStructured` fait 3 tentatives de correction par défaut, comme `run` (avant : 0).
-- Une réponse en JSON nu `{"name", "arguments"}` n'est prise pour un appel d'outil que si `name` correspond à un outil enregistré.
-- Après une correction de sortie structurée réussie, l'historique ne garde que la réponse valide. Les tentatives ratées sont retirées.
-- `runStream` applique maintenant les guardrails, appelle `afterLLMCall` à chaque tour et sauvegarde l'historique.
-- Workflow : un échec d'étape lève une `WorkflowError` (`message` = `Step '<nom>' failed: <message d'origine>`, l'erreur d'origine dans `cause`), et un graphe invalide est rejeté avant la première étape.
-- `FileHistoryAdapter` refuse les `sessionId` contenant des séparateurs de chemin et écrit un JSON compact.
-
----
+Les évolutions de chaque version sont listées dans le [CHANGELOG](./CHANGELOG.md).
 
 ## Licence
 
-Ce projet est sous licence ISC.
+[ISC](https://opensource.org/license/isc-license-txt) © Gaëtan BIORD
