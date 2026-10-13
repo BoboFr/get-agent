@@ -1,6 +1,6 @@
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { readFile, writeFile, access } from "node:fs/promises";
 import { join } from "node:path";
+import { assertSafeId, writeJsonAtomic } from "./fs-utils.js";
 import type { Message } from "./types.js";
 
 export interface HistoryAdapter {
@@ -21,12 +21,12 @@ export class FileHistoryAdapter implements HistoryAdapter {
   }
 
   private filePath(sessionId: string): string {
+    assertSafeId(sessionId, "session id");
     return join(this.dir, `${sessionId}.json`);
   }
 
   async load(sessionId: string): Promise<Message[]> {
     const path = this.filePath(sessionId);
-    if (!existsSync(path)) return [];
     try {
       const raw = await readFile(path, "utf-8");
       return JSON.parse(raw) as Message[];
@@ -36,14 +36,16 @@ export class FileHistoryAdapter implements HistoryAdapter {
   }
 
   async save(sessionId: string, messages: Message[]): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
-    await writeFile(this.filePath(sessionId), JSON.stringify(messages, null, 2), "utf-8");
+    await writeJsonAtomic(this.filePath(sessionId), messages);
   }
 
   async clear(sessionId: string): Promise<void> {
     const path = this.filePath(sessionId);
-    if (existsSync(path)) {
-      await writeFile(path, "[]", "utf-8");
+    try {
+      await access(path);
+    } catch {
+      return; // nothing to clear
     }
+    await writeFile(path, "[]", "utf-8");
   }
 }

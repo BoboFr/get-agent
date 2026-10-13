@@ -28,6 +28,8 @@ npx tsx examples/01_chat_et_sortie_structuree.ts
 | 11 | [11_chat_conversation.ts](11_chat_conversation.ts) | Chat multi-tours en streaming, mémoire, `getHistory`, historique pré-rempli |
 | 12 | [12_scoring_reponses.ts](12_scoring_reponses.ts) | Scoring de réponses (LLM-as-judge), sortie structurée, boucle d'auto-amélioration |
 | 13 | [13_scoring_workflow.ts](13_scoring_workflow.ts) | Scoring orchestré en Workflow (produire → noter → raffiner), garde-fou anti-boucle |
+| 14 | [14_multimodal.ts](14_multimodal.ts) | Images et documents en entrée (`userMessage`, `imageFromFile`, `fileFromPath`) |
+| 15 | [15_workflow_avance.ts](15_workflow_avance.ts) | Workflow avancé : étape parallèle, retry/timeout, mode strict, trace, checkpoint et reprise |
 
 Certains exemples acceptent un argument :
 

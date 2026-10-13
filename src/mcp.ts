@@ -1,36 +1,57 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { Logger } from "./logger.js";
 import { McpServerConfig, Tool } from "./types.js";
+
+/**
+ * Converts an MCP CallToolResult into a tool result suited to the LLM:
+ * text-only content is joined into a plain string, `isError` becomes a thrown error,
+ * and anything else (images, resources, structured content) is returned as-is.
+ */
+function toToolResult(result: any): any {
+  const content: any[] = Array.isArray(result?.content) ? result.content : [];
+  const allText = content.length > 0 && content.every((c) => c?.type === "text");
+  const text = allText ? content.map((c) => c.text).join("\n") : undefined;
+
+  if (result?.isError) {
+    throw new Error(text ?? JSON.stringify(content));
+  }
+  if (result?.structuredContent !== undefined) return result.structuredContent;
+  if (text !== undefined) return text;
+  return result;
+}
 
 export class McpManager {
   private clients: Map<string, Client> = new Map();
-  private transports: Map<string, StdioClientTransport> = new Map();
   private tools: Tool[] = [];
-  private verbose: boolean;
+  private logger: Logger;
 
-  constructor(verbose = false) {
-    this.verbose = verbose;
+  constructor(verbose = false, logger?: Logger) {
+    this.logger = logger ?? new Logger("MCP", { level: verbose ? "debug" : "warn" });
   }
 
   /**
-   * Connects to all configured MCP servers and fetches their tools.
-   * @param configs Array of MCP server configurations.
+   * Connects to all configured MCP servers in parallel and fetches their tools.
+   * Failed connections are logged; with `strict`, the first failure is thrown
+   * after all attempts have settled.
    */
-  async connectAll(configs: McpServerConfig[]): Promise<Tool[]> {
-    for (const config of configs) {
-      try {
-        await this.connectServer(config);
-      } catch (error: any) {
-        if (this.verbose) {
-          console.error(`Failed to connect to MCP server '${config.name}':`, error.message);
-        }
+  async connectAll(configs: McpServerConfig[], strict = false): Promise<Tool[]> {
+    const results = await Promise.allSettled(configs.map((config) => this.connectServer(config)));
+    const failures: Error[] = [];
+    results.forEach((result, i) => {
+      if (result.status === "rejected") {
+        const message = result.reason?.message ?? String(result.reason);
+        this.logger.warn(`Failed to connect to MCP server '${configs[i].name}': ${message}`);
+        failures.push(new Error(`MCP server '${configs[i].name}': ${message}`));
       }
-    }
+    });
+    if (strict && failures.length > 0) throw failures[0];
     return this.tools;
   }
 
   /**
    * Connects to a single MCP server.
+   * Tool names already exposed by another server are prefixed with `<server>_`.
    * @param config The MCP server configuration.
    */
   async connectServer(config: McpServerConfig): Promise<Tool[]> {
@@ -44,42 +65,31 @@ export class McpManager {
       env: {
         ...process.env,
         ...(config.env || {}),
-      } as any,
+      } as Record<string, string>,
     });
 
     const client = new Client(
-      {
-        name: `get-agent-client-${config.name}`,
-        version: "1.0.0",
-      },
-      {
-        capabilities: {},
-      }
+      { name: `get-agent-client-${config.name}`, version: "1.0.0" },
+      { capabilities: {} }
     );
 
     await client.connect(transport);
     this.clients.set(config.name, client);
-    this.transports.set(config.name, transport);
 
-    // Fetch tools supported by this server
     const response = await client.listTools();
+    const taken = new Set(this.tools.map((t) => t.name));
     const serverTools: Tool[] = response.tools.map((mcpTool) => {
-      // Create a unified Tool interface wrapper
-      const tool: Tool = {
-        // We namespace or keep the original name. Let's use the original name
-        // but verify later that there are no duplicates.
-        name: mcpTool.name,
+      const name = taken.has(mcpTool.name) ? `${config.name}_${mcpTool.name}` : mcpTool.name;
+      if (name !== mcpTool.name) {
+        this.logger.warn(`MCP tool '${mcpTool.name}' from '${config.name}' collides with another server; exposed as '${name}'.`);
+      }
+      taken.add(name);
+      return {
+        name,
         description: mcpTool.description || "",
         schema: mcpTool.inputSchema || { type: "object", properties: {} },
-        execute: async (args) => {
-          const result = await client.callTool({
-            name: mcpTool.name,
-            arguments: args,
-          });
-          return result;
-        },
+        execute: async (args) => toToolResult(await client.callTool({ name: mcpTool.name, arguments: args })),
       };
-      return tool;
     });
 
     this.tools.push(...serverTools);
@@ -97,18 +107,17 @@ export class McpManager {
    * Disconnects and stops all MCP servers cleanly.
    */
   async disconnectAll(): Promise<void> {
-    for (const [name, client] of this.clients.entries()) {
-      try {
-        await client.close();
-      } catch (error: any) {
-        if (this.verbose) {
-          console.error(`Error closing MCP client '${name}':`, error.message);
+    await Promise.all(
+      [...this.clients.entries()].map(async ([name, client]) => {
+        try {
+          await client.close();
+        } catch (error: any) {
+          this.logger.warn(`Error closing MCP client '${name}': ${error.message}`);
         }
-      }
-    }
+      })
+    );
 
     this.clients.clear();
-    this.transports.clear();
     this.tools = [];
   }
 }

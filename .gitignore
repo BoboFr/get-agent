@@ -13,5 +13,6 @@ examples/**/*.js
 
 # Divers
 .agent-history/
+.workflow-checkpoints/
 *.log
 .env

@@ -51,7 +51,8 @@ async function main() {
   console.log("─".repeat(50));
   console.log(`📜 Historique : ${historique.length} message(s)`);
   for (const m of historique) {
-    const apercu = (m.content ?? "[appel d'outil]").replace(/\s+/g, " ").slice(0, 60);
+    const texte = typeof m.content === "string" ? m.content : m.content ? "[contenu multimodal]" : "[appel d'outil]";
+    const apercu = texte.replace(/\s+/g, " ").slice(0, 60);
     console.log(`   [${m.role.padEnd(9)}] ${apercu}`);
   }
 

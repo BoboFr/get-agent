@@ -89,6 +89,26 @@ export interface McpServerConfig {
   env?: Record<string, string>;
 }
 
+/**
+ * How tool calls are exchanged with the model.
+ * - "native": standard OpenAI `tools` / `tool_calls` only.
+ * - "lfm": also lists the tools in the system prompt (LiquidAI LFM templates).
+ * - "auto": "lfm" when the model name contains "lfm", "native" otherwise.
+ * Tool calls embedded in text content are recovered in every mode.
+ */
+export type ToolCallFormat = "native" | "lfm" | "auto";
+
+export interface ContextConfig {
+  /**
+   * Max number of non-system messages sent to the LLM. Older messages are dropped
+   * (the system prompt is always kept, and an assistant tool call is never split
+   * from its tool results). The stored history is not modified.
+   */
+  maxMessages?: number;
+  /** Tool results longer than this are truncated before being stored in the history. */
+  maxToolResultChars?: number;
+}
+
 export interface AgentConfig {
   name: string;
   systemPrompt?: string;
@@ -117,6 +137,17 @@ export interface AgentConfig {
   sessionId?: string;
   /** Input/output content filters. */
   guardrails?: Guardrails;
+  /** How tool calls are exchanged with the model. Default: "auto". */
+  toolCallFormat?: ToolCallFormat;
+  /** Limits on what is sent to the LLM on each call. Default: no limit. */
+  context?: ContextConfig;
+  /** If true, a failed MCP server connection makes initialize() throw. Default: false (logged as a warning). */
+  mcpStrict?: boolean;
+}
+
+export interface RunOptions {
+  /** Aborts the run (LLM calls and retry waits) when signalled. */
+  signal?: AbortSignal;
 }
 
 export interface TokenUsage {
@@ -159,10 +190,16 @@ export interface RetryConfig {
   maxDelayMs?: number;
   /** HTTP status codes that trigger a retry. Default: [429, 500, 502, 503, 504]. */
   retryableStatuses?: number[];
+  /**
+   * Timeout in ms for each LLM attempt (a timed-out attempt is retried).
+   * For streaming calls it bounds the wait for the response headers only. Default: none.
+   */
+  timeoutMs?: number;
 }
 
-export interface StructuredOutputConfig<T extends z.ZodType> {
+export interface StructuredOutputConfig<T extends z.ZodType> extends RunOptions {
   schema: T;
   prompt?: string;
+  /** Number of correction attempts when validation fails. Default: 3. */
   maxRetries?: number;
 }

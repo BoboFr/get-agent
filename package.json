@@ -1,16 +1,29 @@
 {
   "name": "@thegetget/get-agent",
-  "version": "1.0.7",
+  "version": "1.1.0",
   "description": "A lightweight AI Agent framework in TypeScript with Zod validation, tool calling, and MCP support.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20.3"
+  },
   "scripts": {
-    "build": "tsc && javascript-obfuscator ./dist --output ./dist",
-    "prepublishOnly": "npm run build",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
     "patch": "npm version patch && npm run build && npm pack && npm publish --access=public"
   },
   "keywords": [
@@ -23,16 +36,15 @@
   "author": "Gaëtan BIORD",
   "license": "ISC",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.1",
-    "dotenv": "^16.4.5"
+    "@modelcontextprotocol/sdk": "^1.32.1"
   },
   "peerDependencies": {
     "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.12.7",
-    "javascript-obfuscator": "^5.4.3",
     "typescript": "^5.4.5",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "vitest": "^3.2.4"
   }
 }

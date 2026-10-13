@@ -35,6 +35,8 @@ npm install @thegetget/get-agent zod@^4
 
 > ⚠️ **Version de Zod requise : v4 (`^4.0.0`).** GetAgent déclare `zod` en `peerDependency` sur la branche v4 et s'appuie sur le convertisseur natif `z.toJSONSchema()`. Si votre projet a encore Zod v3, mettez à jour avec `npm install zod@^4` — sinon vous obtiendrez une erreur de types `TS2740` au passage d'un schéma à `agent.run()` (les classes `ZodType` de v3 et v4 ne sont pas structurellement compatibles).
 
+> ℹ️ **Node.js ≥ 20.3 requis** (utilisation de `fetch`, `AbortSignal.any` et `structuredClone` natifs).
+
 ---
 
 ## Exemples Concrets
@@ -533,6 +535,65 @@ const etatFinal = await workflow.run({
 console.log("Article validé et publié !\n", etatFinal.draft);
 ```
 
+### 10.1. Workflow Avancé — Parallélisme, Fiabilité, Reprise
+
+Le moteur de workflow propose des fonctions supplémentaires, toutes facultatives :
+
+```typescript
+import { z } from "zod";
+import { Workflow, END, FileCheckpointAdapter, WorkflowError } from "@thegetget/get-agent";
+
+const Etat = z.object({
+  avis: z.string(),
+  sentiment: z.string().optional(),
+  themes: z.array(z.string()).default([]),
+  synthese: z.string().default(""),
+});
+
+// fromSchema : run() accepte le type d'entrée du schéma (les champs avec .default() sont facultatifs)
+const wf = Workflow.fromSchema(Etat, {
+  name: "Analyse",
+  strict: true,                 // chaque étape doit avoir une arête sortante ; état figé dans les étapes
+  validate: "each-step",        // ou "end" (Zod seulement au début et à la fin) ou "none"
+  checkpoint: new FileCheckpointAdapter(".workflow-checkpoints"),
+  hooks: { onStepEnd: (step, { durationMs }) => console.log(step, durationMs) },
+});
+
+wf
+  // Les branches s'exécutent en même temps sur un instantané de l'état, puis leurs mises à jour sont fusionnées
+  .addParallelStep("analyser", {
+    sentiment: async (s, ctx) => ({ sentiment: await classer(s.avis, ctx.signal) }),
+    themes: async (s) => ({ themes: await extraireThemes(s.avis) }),
+  }, { retries: 1, timeoutMs: 60_000 })
+  .addStep("synthese", async (s) => ({ synthese: `${s.sentiment} : ${s.themes.join(", ")}` }))
+  .setStart("analyser")
+  .addEdge("analyser", "synthese")
+  .addEdge("synthese", END);
+
+try {
+  const { state, trace } = await wf.runWithTrace({ avis: "…" }, { runId: "avis-42", signal });
+} catch (err) {
+  if (err instanceof WorkflowError) console.error(err.step, err.state, err.cause);
+  const repris = await wf.resume("avis-42"); // reprend à la première étape non terminée
+}
+```
+
+| Fonction | Détail |
+| --- | --- |
+| Validation du graphe | `validate()` est appelé automatiquement avant le premier run : étape de départ, cibles des arêtes, cibles déclarées des conditions. Un graphe invalide échoue **avant** d'exécuter la moindre étape. Les étapes inatteignables sont signalées par un `warn`. |
+| `END` | Constante exportée (`"END"`, l'alias `"__end__"` reste accepté). Ces noms ne peuvent pas servir de nom d'étape. |
+| `addConditionalEdge(from, fn, targets?)` | Si `targets` est fourni, les cibles sont vérifiées au démarrage, et une valeur renvoyée hors de cette liste lève une erreur qui nomme l'étape source. |
+| `addParallelStep(name, branches, opts?)` | Branches exécutées avec `Promise.all`. Si deux branches écrivent la même clé, c'est une erreur, sauf si `opts.merge(updates, state)` est fourni. Quand une branche échoue, le `signal` des autres est annulé. |
+| Options d'étape | `{ retries, retryDelayMs, timeoutMs }` sur `addStep` / `addParallelStep`. Chaque étape reçoit `ctx = { signal, step, stepCount, attempt, branch? }`. |
+| `run(state, { signal, runId })` | `signal` interrompt le workflow. `runId` active la sauvegarde d'un checkpoint après chaque étape. |
+| `runWithTrace()` | Renvoie `{ state, trace }`, où `trace` liste pour chaque étape `step`, `durationMs`, `attempts`, `update` et `next`. |
+| `resume(runId)` | Reprend depuis le dernier checkpoint (`MemoryCheckpointAdapter`, `FileCheckpointAdapter`, ou votre propre `CheckpointAdapter`). L'état doit être sérialisable en JSON. |
+| `WorkflowError` | Porte `workflow`, `step`, `stepCount`, `state` et `cause` (l'erreur d'origine). |
+| `strict` | Une étape sans arête sortante devient une erreur, et l'état passé aux étapes est figé (`Object.freeze`). En dehors du mode strict, ne modifiez pas `state` directement : renvoyez une mise à jour. |
+
+> Les clés renvoyées par une étape mais absentes du `stateSchema` sont supprimées par Zod. Un `warn` les liste.
+> Un `timeoutMs` fait échouer l'étape et annule `ctx.signal`. Une étape qui ignore ce signal continue de s'exécuter en arrière-plan.
+
 ### 11. Streaming (Réponse en Temps Réel)
 
 `agent.runStream()` renvoie un `AsyncGenerator` qui diffuse la réponse finale token par token. Les appels d'outils sont gérés en interne et de façon transparente : seul le texte final est émis.
@@ -841,6 +902,33 @@ const agent = new Agent({
 console.log(await agent.run("Compare la météo de Paris et de Lyon."));
 ```
 
+### 22. Timeout, Annulation & Fenêtre de Contexte
+
+```typescript
+import { Agent } from "@thegetget/get-agent";
+
+const agent = new Agent({
+  name: "Assistant",
+  retry: { timeoutMs: 30_000 },      // timeout par tentative (en streaming : jusqu'aux en-têtes de réponse)
+  context: {
+    maxMessages: 40,                 // n'envoie au LLM que les 40 derniers messages (+ le prompt système)
+    maxToolResultChars: 20_000,      // tronque les résultats d'outils trop longs dans l'historique
+  },
+  toolCallFormat: "auto",            // "native" | "lfm" | "auto" (LFM détecté via le nom du modèle)
+  mcpStrict: false,                  // true : un serveur MCP injoignable fait échouer initialize()
+});
+
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 5_000);
+await agent.run("Question longue…", { signal: controller.signal });
+for await (const chunk of agent.runStream("…", { signal: controller.signal })) process.stdout.write(chunk);
+```
+
+- Le code `429` respecte l'en-tête `Retry-After`. Une annulation demandée par l'appelant n'est jamais retentée.
+- `context.maxMessages` ne modifie pas l'historique stocké. Il ne sépare jamais un appel d'outil de son résultat.
+- **Concurrence :** les appels `run` / `runStream` sur une **même instance** sont mis en file et exécutés l'un après l'autre, car ils partagent l'historique. Un agent ne doit pas s'appeler lui-même comme outil, sinon il reste bloqué indéfiniment (interblocage).
+- **Guardrails de sortie en streaming :** ils s'appliquent au texte complet une fois le flux terminé. Un blocage lève une erreur après la diffusion, et `sanitized` ne peut pas s'appliquer.
+
 ---
 
 ## Référence de Configuration (`AgentConfig`)
@@ -867,14 +955,17 @@ console.log(await agent.run("Compare la météo de Paris et de Lyon."));
 | `logger` | `LoggerConfig` | — | Journalisation structurée (voir §20). |
 | `retry` | `RetryConfig` | voir §21 | Stratégie de retry des appels LLM. |
 | `parallelTools` | `boolean` | `false` | Exécution parallèle des outils. |
+| `toolCallFormat` | `"native" \| "lfm" \| "auto"` | `"auto"` | Mode d'échange des appels d'outils (voir §22). |
+| `context` | `ContextConfig` | — | `maxMessages`, `maxToolResultChars` (voir §22). |
+| `mcpStrict` | `boolean` | `false` | Fait échouer `initialize()` si un serveur MCP est injoignable. |
 | `verbose` | `boolean` | `false` | Logs de debug sur la console. |
 
 ### Principales méthodes de `Agent`
 
 | Méthode | Description |
 | --- | --- |
-| `run(input, structuredConfig?)` | Exécute la boucle agent ; renvoie un texte ou un objet validé. |
-| `runStream(input)` | Diffuse la réponse finale token par token (`AsyncGenerator`). |
+| `run(input, structuredConfig? \| { signal })` | Exécute la boucle agent ; renvoie un texte ou un objet validé. |
+| `runStream(input, { signal }?)` | Diffuse la réponse finale token par token (`AsyncGenerator`). |
 | `runStreamStructured(input, config)` | `{ stream, result }` : flux + objet validé. |
 | `repl(options?)` | Lance une session interactive en terminal. |
 | `addSkill(skill)` / `removeSkill(name)` | Gestion dynamique des skills. |
@@ -882,6 +973,29 @@ console.log(await agent.run("Compare la météo de Paris et de Lyon."));
 | `getHistory()` / `clearHistory()` | Lecture / réinitialisation de l'historique. |
 | `getUsage()` / `clearUsage()` | Suivi / réinitialisation de la consommation. |
 | `initialize()` / `shutdown()` | Connexion / nettoyage (MCP, skills). |
+
+---
+
+## Développement
+
+```bash
+npm install
+npm run typecheck   # vérification des types (src + tests)
+npm test            # suite Vitest (fetch simulé, aucun LLM requis)
+npm run build       # compilation vers dist/ (JS lisible + .d.ts + source maps)
+```
+
+## Changements de comportement (1.1.0)
+
+- Le niveau de log par défaut passe de `error` à `warn`, pour que les échecs de connexion MCP soient visibles.
+- Le résultat d'un outil MCP est aplati : le texte est joint, `structuredContent` est renvoyé tel quel, et `isError` devient une erreur. Avant, c'était l'objet `CallToolResult` brut.
+- Deux serveurs MCP qui exposent le même nom d'outil : celui du second est préfixé `<serveur>_`.
+- `runStreamStructured` fait 3 tentatives de correction par défaut, comme `run` (avant : 0).
+- Une réponse en JSON nu `{"name", "arguments"}` n'est prise pour un appel d'outil que si `name` correspond à un outil enregistré.
+- Après une correction de sortie structurée réussie, l'historique ne garde que la réponse valide. Les tentatives ratées sont retirées.
+- `runStream` applique maintenant les guardrails, appelle `afterLLMCall` à chaque tour et sauvegarde l'historique.
+- Workflow : un échec d'étape lève une `WorkflowError` (`message` = `Step '<nom>' failed: <message d'origine>`, l'erreur d'origine dans `cause`), et un graphe invalide est rejeté avant la première étape.
+- `FileHistoryAdapter` refuse les `sessionId` contenant des séparateurs de chemin et écrit un JSON compact.
 
 ---
 

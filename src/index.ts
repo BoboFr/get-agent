@@ -5,8 +5,25 @@ export type { SkillConfig } from "./skill.js";
 export { McpManager } from "./mcp.js";
 export * from "./types.js";
 export { LLMClient, LLMError } from "./llm.js";
-export { Workflow } from "./workflow.js";
-export type { WorkflowConfig, StepFunction, ConditionFunction } from "./workflow.js";
+export type { LLMRequestOptions } from "./llm.js";
+export { StreamTagParser } from "./stream-parser.js";
+export type { StreamTagParserOptions } from "./stream-parser.js";
+export { extractToolCalls } from "./parsing.js";
+export { Workflow, WorkflowError, END } from "./workflow.js";
+export type {
+  WorkflowConfig,
+  WorkflowHooks,
+  WorkflowRunOptions,
+  WorkflowResult,
+  StepFunction,
+  StepContext,
+  StepOptions,
+  StepTrace,
+  ParallelStepOptions,
+  ConditionFunction,
+} from "./workflow.js";
+export { MemoryCheckpointAdapter, FileCheckpointAdapter } from "./checkpoint.js";
+export type { CheckpointAdapter, WorkflowCheckpoint } from "./checkpoint.js";
 export { createAgentTool } from "./agent-tool.js";
 export type { AgentToolOptions } from "./agent-tool.js";
 export { Logger } from "./logger.js";
