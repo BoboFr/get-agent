@@ -2,7 +2,9 @@ import { z } from "zod";
 import { LLMClient } from "./llm.js";
 import type { LLMRequestOptions } from "./llm.js";
 import { McpManager } from "./mcp.js";
-import { Skill } from "./skill.js";
+import { Toolkit } from "./toolkit.js";
+import { agentSkillsPrompt, createAgentSkillTools, loadAgentSkills } from "./agent-skill.js";
+import type { AgentSkill } from "./agent-skill.js";
 import { Logger } from "./logger.js";
 import type { LoggerConfig } from "./logger.js";
 import type { HistoryAdapter } from "./history.js";
@@ -37,7 +39,7 @@ const DEFAULT_STRUCTURED_RETRIES = 3;
 
 export class Agent {
   private config: Required<Omit<AgentConfig,
-    'skills' | 'hooks' | 'onApprovalRequired' | 'budget' | 'logger' | 'retry' | 'parallelTools' |
+    'skills' | 'toolkits' | 'agentSkills' | 'hooks' | 'onApprovalRequired' | 'budget' | 'logger' | 'retry' | 'parallelTools' |
     'historyAdapter' | 'sessionId' | 'guardrails' | 'toolCallFormat' | 'context' | 'mcpStrict'
   >> & {
     verbose: boolean;
@@ -53,6 +55,7 @@ export class Agent {
     toolCallFormat: ToolCallFormat;
     context: ContextConfig;
     mcpStrict: boolean;
+    agentSkills: Array<string | AgentSkill>;
   };
 
   private sessionUsage = { totalPromptTokens: 0, totalCompletionTokens: 0, totalTokens: 0, llmCallCount: 0 };
@@ -61,7 +64,10 @@ export class Agent {
   private mcpManager: McpManager;
   private localTools: Map<string, Tool> = new Map();
   private mcpTools: Map<string, Tool> = new Map();
-  private skills: Map<string, Skill> = new Map();
+  private toolkits: Map<string, Toolkit> = new Map();
+  private agentSkills: Map<string, AgentSkill> = new Map();
+  /** Names of the load_skill / read_skill_file tools registered for agent skills. */
+  private agentSkillToolNames: string[] = [];
   private isInitialized = false;
   private initPromise: Promise<void> | null = null;
   private messageHistory: Message[] = [];
@@ -96,6 +102,7 @@ export class Agent {
       toolCallFormat: config.toolCallFormat ?? "auto",
       context: config.context ?? {},
       mcpStrict: config.mcpStrict ?? false,
+      agentSkills: config.agentSkills ?? [],
     };
 
     this.logger = new Logger(`Agent: ${config.name}`, {
@@ -111,16 +118,14 @@ export class Agent {
       this.localTools.set(tool.name, tool);
     }
 
-    if (config.skills) {
-      for (const skill of config.skills) {
-        this.registerSkill(skill);
-      }
+    for (const toolkit of [...(config.toolkits ?? []), ...(config.skills ?? [])]) {
+      this.registerToolkit(toolkit);
     }
   }
 
   /**
-   * Initializes the agent: runs skill initializers, connects to configured MCP servers
-   * and loads the persisted history. Safe to call concurrently; runs only once.
+   * Initializes the agent: runs toolkit initializers, loads Agent Skills, connects to
+   * configured MCP servers and loads the persisted history. Safe to call concurrently; runs only once.
    */
   initialize(): Promise<void> {
     if (!this.initPromise) {
@@ -133,17 +138,21 @@ export class Agent {
   }
 
   private async doInitialize(): Promise<void> {
-    if (this.skills.size > 0) {
-      this.log(`Initializing ${this.skills.size} skill(s): ${[...this.skills.keys()].join(", ")}...`);
-      for (const [name, skill] of this.skills) {
+    if (this.toolkits.size > 0) {
+      this.log(`Initializing ${this.toolkits.size} toolkit(s): ${[...this.toolkits.keys()].join(", ")}...`);
+      for (const [name, toolkit] of this.toolkits) {
         try {
-          await skill.initialize();
-          this.log(`Skill '${name}' initialized.`);
+          await toolkit.initialize();
+          this.log(`Toolkit '${name}' initialized.`);
         } catch (err: any) {
-          this.logger.error(`Failed to initialize skill '${name}': ${err.message}`);
+          this.logger.error(`Failed to initialize toolkit '${name}': ${err.message}`);
           throw err;
         }
       }
+    }
+
+    if (this.config.agentSkills.length > 0) {
+      await this.loadAgentSkills(this.config.agentSkills);
     }
 
     if (this.config.mcpServers.length > 0) {
@@ -173,56 +182,111 @@ export class Agent {
   }
 
   /**
-   * Returns a list of all currently registered tools (local, skills, and MCP).
+   * Returns a list of all currently registered tools (local, toolkits, agent skills and MCP).
    */
   getRegisteredTools(): Tool[] {
     return [...this.localTools.values(), ...this.mcpTools.values()];
   }
 
   /**
-   * Returns a list of all registered skills.
+   * Returns a list of all registered toolkits.
    */
-  getRegisteredSkills(): Skill[] {
-    return [...this.skills.values()];
+  getRegisteredToolkits(): Toolkit[] {
+    return [...this.toolkits.values()];
   }
 
   /**
-   * Adds a skill dynamically to the agent.
-   * If the agent is already initialized, the skill's initialize() hook is called immediately.
-   * @param skill The Skill instance to add.
+   * Returns the Agent Skills (SKILL.md folders) available to the model.
+   * Populated by initialize().
    */
-  async addSkill(skill: Skill): Promise<void> {
-    this.registerSkill(skill);
-    if (this.isInitialized && !skill.isReady()) {
-      await skill.initialize();
-      this.log(`Skill '${skill.getName()}' dynamically initialized.`);
+  getAgentSkills(): AgentSkill[] {
+    return [...this.agentSkills.values()];
+  }
+
+  /**
+   * Adds a toolkit dynamically to the agent.
+   * If the agent is already initialized, the toolkit's initialize() hook is called immediately.
+   * @param toolkit The Toolkit instance to add.
+   */
+  async addToolkit(toolkit: Toolkit): Promise<void> {
+    this.registerToolkit(toolkit);
+    if (this.isInitialized && !toolkit.isReady()) {
+      await toolkit.initialize();
+      this.log(`Toolkit '${toolkit.getName()}' dynamically initialized.`);
     }
   }
 
   /**
-   * Removes a skill and all its associated tools from the agent.
-   * If the skill is initialized, its shutdown() hook is called.
-   * @param skillName The name of the skill to remove.
+   * Removes a toolkit and all its associated tools from the agent.
+   * If the toolkit is initialized, its shutdown() hook is called.
+   * @param name The name of the toolkit to remove.
    */
-  async removeSkill(skillName: string): Promise<void> {
-    const skill = this.skills.get(skillName);
-    if (!skill) {
-      this.log(`Skill '${skillName}' not found, nothing to remove.`);
+  async removeToolkit(name: string): Promise<void> {
+    const toolkit = this.toolkits.get(name);
+    if (!toolkit) {
+      this.log(`Toolkit '${name}' not found, nothing to remove.`);
       return;
     }
 
-    if (skill.isReady()) {
-      await skill.shutdown();
+    if (toolkit.isReady()) {
+      await toolkit.shutdown();
     }
 
-    for (const tool of skill.getTools()) {
+    for (const tool of toolkit.getTools()) {
       this.localTools.delete(tool.name);
-      this.log(`Removed skill tool: ${tool.name}`);
+      this.log(`Removed toolkit tool: ${tool.name}`);
     }
     this.toolsPayloadCache = null;
 
-    this.skills.delete(skillName);
-    this.log(`Skill '${skillName}' removed.`);
+    this.toolkits.delete(name);
+    this.log(`Toolkit '${name}' removed.`);
+  }
+
+  /** @deprecated Use {@link getRegisteredToolkits}. */
+  getRegisteredSkills(): Toolkit[] {
+    return this.getRegisteredToolkits();
+  }
+
+  /** @deprecated Use {@link addToolkit}. */
+  addSkill(toolkit: Toolkit): Promise<void> {
+    return this.addToolkit(toolkit);
+  }
+
+  /** @deprecated Use {@link removeToolkit}. */
+  removeSkill(name: string): Promise<void> {
+    return this.removeToolkit(name);
+  }
+
+  /**
+   * Resolves Agent Skill sources (paths or loaded skills) and exposes them to the
+   * model through the load_skill / read_skill_file tools.
+   */
+  private async loadAgentSkills(sources: Array<string | AgentSkill>): Promise<void> {
+    for (const source of sources) {
+      const skills = typeof source === "string" ? await loadAgentSkills(source) : [source];
+      if (typeof source === "string" && skills.length === 0) {
+        this.logger.warn(`No Agent Skill (SKILL.md) found in '${source}'.`);
+      }
+      for (const skill of skills) {
+        const existing = this.agentSkills.get(skill.name);
+        if (existing && existing.dir !== skill.dir) {
+          throw new Error(`Agent Skill name collision: '${skill.name}' is defined in '${existing.dir}' and '${skill.dir}'.`);
+        }
+        this.agentSkills.set(skill.name, skill);
+        this.log(`Agent Skill available: ${skill.name}`);
+      }
+    }
+    if (this.agentSkills.size === 0) return;
+
+    const tools = createAgentSkillTools(this.agentSkills);
+    for (const tool of tools) {
+      if (this.localTools.has(tool.name)) {
+        throw new Error(`Tool name collision: '${tool.name}' is reserved for Agent Skills on agent '${this.config.name}'.`);
+      }
+    }
+    for (const tool of tools) this.localTools.set(tool.name, tool);
+    this.agentSkillToolNames = tools.map((t) => t.name);
+    this.toolsPayloadCache = null;
   }
 
   /**
@@ -621,14 +685,19 @@ export class Agent {
   async shutdown(): Promise<void> {
     this.log("Shutting down agent...");
 
-    for (const [name, skill] of this.skills) {
+    for (const [name, toolkit] of this.toolkits) {
       try {
-        await skill.shutdown();
-        this.log(`Skill '${name}' shut down.`);
+        await toolkit.shutdown();
+        this.log(`Toolkit '${name}' shut down.`);
       } catch (err: any) {
-        this.logger.error(`Failed to shut down skill '${name}': ${err.message}`);
+        this.logger.error(`Failed to shut down toolkit '${name}': ${err.message}`);
       }
     }
+
+    // Agent Skills are reloaded from disk on the next initialize().
+    for (const name of this.agentSkillToolNames) this.localTools.delete(name);
+    this.agentSkillToolNames = [];
+    this.agentSkills.clear();
 
     await this.mcpManager.disconnectAll();
     this.mcpTools.clear();
@@ -764,42 +833,42 @@ export class Agent {
   }
 
   /**
-   * Registers a skill's tools into the agent's localTools map.
+   * Registers a toolkit's tools into the agent's localTools map.
    */
-  private registerSkill(skill: Skill): void {
-    const skillName = skill.getName();
-    if (this.skills.has(skillName)) {
-      throw new Error(`Skill '${skillName}' is already registered on agent '${this.config.name}'.`);
+  private registerToolkit(toolkit: Toolkit): void {
+    const name = toolkit.getName();
+    if (this.toolkits.has(name)) {
+      throw new Error(`Toolkit '${name}' is already registered on agent '${this.config.name}'.`);
     }
 
-    const skillTools = skill.getTools();
-    for (const tool of skillTools) {
+    const tools = toolkit.getTools();
+    for (const tool of tools) {
       if (this.localTools.has(tool.name)) {
         throw new Error(
-          `Tool name collision: '${tool.name}' from skill '${skillName}' conflicts with an existing tool on agent '${this.config.name}'.`
+          `Tool name collision: '${tool.name}' from toolkit '${name}' conflicts with an existing tool on agent '${this.config.name}'.`
         );
       }
     }
 
-    this.skills.set(skillName, skill);
-    for (const tool of skillTools) {
+    this.toolkits.set(name, toolkit);
+    for (const tool of tools) {
       this.localTools.set(tool.name, tool);
-      this.log(`Registered skill tool: ${tool.name} (from skill '${skillName}')`);
+      this.log(`Registered toolkit tool: ${tool.name} (from toolkit '${name}')`);
     }
     this.toolsPayloadCache = null;
   }
 
   /**
-   * Builds the full system prompt by appending all skill system prompts.
+   * Builds the full system prompt: base prompt, toolkit prompts, then the
+   * catalog of Agent Skills (names and descriptions only).
    */
   private buildSystemPrompt(): string {
-    const skillPrompts = [...this.skills.values()]
-      .map((skill) => skill.getSystemPrompt())
-      .filter((sp): sp is string => !!sp);
-
-    return skillPrompts.length > 0
-      ? `${this.config.systemPrompt}\n\n${skillPrompts.join("\n\n")}`
-      : this.config.systemPrompt;
+    const sections = [
+      this.config.systemPrompt,
+      ...[...this.toolkits.values()].map((toolkit) => toolkit.getSystemPrompt()),
+      agentSkillsPrompt(this.getAgentSkills()),
+    ].filter((section): section is string => !!section);
+    return sections.join("\n\n");
   }
 
   /**

@@ -1,5 +1,18 @@
 export { Agent } from "./agent.js";
 export { createTool } from "./tool.js";
+export { Toolkit, createToolkit } from "./toolkit.js";
+export type { ToolkitConfig } from "./toolkit.js";
+export {
+  loadAgentSkill,
+  loadAgentSkills,
+  createAgentSkillTools,
+  agentSkillsPrompt,
+  readAgentSkillInstructions,
+  readAgentSkillFile,
+  listAgentSkillFiles,
+} from "./agent-skill.js";
+export type { AgentSkill, AgentSkillToolsOptions } from "./agent-skill.js";
+/** @deprecated Use Toolkit / createToolkit. */
 export { Skill, createSkill } from "./skill.js";
 export type { SkillConfig } from "./skill.js";
 export { McpManager } from "./mcp.js";

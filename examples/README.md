@@ -17,7 +17,7 @@ npx tsx examples/01_chat_et_sortie_structuree.ts
 | --- | --- | --- |
 | 01 | [01_chat_et_sortie_structuree.ts](01_chat_et_sortie_structuree.ts) | Chat de base, sortie structurée validée par Zod |
 | 02 | [02_outils.ts](02_outils.ts) | `createTool`, validation Zod, `parallelTools` |
-| 03 | [03_skills.ts](03_skills.ts) | Skills, préfixage, ajout/suppression à chaud |
+| 03 | [03_toolkits.ts](03_toolkits.ts) | Toolkits, préfixage, ajout/suppression à chaud |
 | 04 | [04_mcp.ts](04_mcp.ts) | Connexion à un serveur MCP (filesystem) |
 | 05 | [05_workflow.ts](05_workflow.ts) | Workflow : arêtes simples, conditionnelles, boucle |
 | 06 | [06_streaming_et_repl.ts](06_streaming_et_repl.ts) | `runStream`, `runStreamStructured`, `repl` |
@@ -30,6 +30,7 @@ npx tsx examples/01_chat_et_sortie_structuree.ts
 | 13 | [13_scoring_workflow.ts](13_scoring_workflow.ts) | Scoring orchestré en Workflow (produire → noter → raffiner), garde-fou anti-boucle |
 | 14 | [14_multimodal.ts](14_multimodal.ts) | Images et documents en entrée (`userMessage`, `imageFromFile`, `fileFromPath`) |
 | 15 | [15_workflow_avance.ts](15_workflow_avance.ts) | Workflow avancé : étape parallèle, retry/timeout, mode strict, trace, checkpoint et reprise |
+| 16 | [16_agent_skills.ts](16_agent_skills.ts) | Agent Skills (`SKILL.md`) chargées à la demande, avec les skills d'exemple de [`skills/`](skills) |
 
 Certains exemples acceptent un argument :
 

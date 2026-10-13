@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { Agent, createAgentTool, createSkill, createTool, maxLength, redactPII } from "../src/index.js";
+import { Agent, Skill, Toolkit, createAgentTool, createSkill, createTool, createToolkit, maxLength, redactPII } from "../src/index.js";
 import type { HistoryAdapter, Message } from "../src/index.js";
 import { collect, completion, mockFetch, streamOf } from "./helpers.js";
 
@@ -82,25 +82,43 @@ describe("Agent.run", () => {
     ]);
   });
 
-  it("initializes skills only once under concurrent runs", async () => {
+  it("initializes toolkits only once under concurrent runs", async () => {
     const init = vi.fn();
-    const skill = createSkill({ name: "math", description: "", tools: [addTool], initialize: init, systemPrompt: "Use math." });
+    const toolkit = createToolkit({ name: "math", description: "", tools: [addTool], initialize: init, systemPrompt: "Use math." });
     mockFetch([completion("a"), completion("b")]);
-    const agent = newAgent({ skills: [skill] });
+    const agent = newAgent({ toolkits: [toolkit] });
     await Promise.all([agent.run("1"), agent.run("2")]);
     expect(init).toHaveBeenCalledTimes(1);
     expect(agent.getHistory()[0].content).toBe("You are a helpful AI assistant.\n\nUse math.");
     expect(agent.getRegisteredTools().map((t) => t.name)).toEqual(["math_add"]);
   });
 
-  it("invalidates the tools payload when skills change", async () => {
-    const http = mockFetch([completion("a"), completion("b")]);
+  it("invalidates the tools payload when toolkits change", async () => {
+    const http = mockFetch([completion("a"), completion("b"), completion("c")]);
     const agent = newAgent({ tools: [addTool] });
     await agent.run("1");
-    await agent.addSkill(createSkill({ name: "s", description: "", tools: [addTool] }));
+    await agent.addToolkit(createToolkit({ name: "s", description: "", tools: [addTool] }));
     await agent.run("2");
+    await agent.removeToolkit("s");
+    await agent.run("3");
     expect(http.body(0).tools.map((t: any) => t.function.name)).toEqual(["add"]);
     expect(http.body(1).tools.map((t: any) => t.function.name)).toEqual(["add", "s_add"]);
+    expect(http.body(2).tools.map((t: any) => t.function.name)).toEqual(["add"]);
+  });
+
+  it("keeps the deprecated Skill aliases working", async () => {
+    mockFetch([completion("ok")]);
+    const legacy = createSkill({ name: "legacy", description: "", tools: [addTool], systemPrompt: "Legacy." });
+    expect(legacy).toBeInstanceOf(Toolkit);
+    expect(Skill).toBe(Toolkit);
+
+    const agent = newAgent({ skills: [legacy] });
+    await agent.addSkill(createSkill({ name: "extra", description: "", tools: [addTool] }));
+    expect(agent.getRegisteredSkills().map((t) => t.getName())).toEqual(["legacy", "extra"]);
+    await agent.run("q");
+    expect(agent.getHistory()[0].content).toBe("You are a helpful AI assistant.\n\nLegacy.");
+    await agent.removeSkill("extra");
+    expect(agent.getRegisteredToolkits().map((t) => t.getName())).toEqual(["legacy"]);
   });
 
   it("passes an AbortSignal through to fetch", async () => {

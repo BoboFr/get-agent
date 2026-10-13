@@ -1,5 +1,6 @@
 import { z } from "zod";
-import type { Skill } from "./skill.js";
+import type { Toolkit } from "./toolkit.js";
+import type { AgentSkill } from "./agent-skill.js";
 import type { LoggerConfig } from "./logger.js";
 import type { HistoryAdapter } from "./history.js";
 import type { Guardrails } from "./guardrails.js";
@@ -116,7 +117,15 @@ export interface AgentConfig {
   baseUrl?: string;
   apiKey?: string;
   tools?: Tool[];
-  skills?: Skill[];
+  /** Bundles of tools with their own system prompt and lifecycle hooks. */
+  toolkits?: Toolkit[];
+  /** @deprecated Renamed to `toolkits`. Will be removed in 2.0. */
+  skills?: Toolkit[];
+  /**
+   * Agent Skills (SKILL.md folders) offered to the model on demand. Each entry is a
+   * skill folder, a folder containing skill folders, or an already loaded skill.
+   */
+  agentSkills?: Array<string | AgentSkill>;
   mcpServers?: McpServerConfig[];
   maxIterations?: number;
   temperature?: number;

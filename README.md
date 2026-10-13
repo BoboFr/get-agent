@@ -38,6 +38,7 @@ console.log(await agent.run("Quel temps fait-il à Lyon ?"));
 - **Typé de bout en bout.** Les arguments des outils, les sorties structurées et l'état des workflows sont décrits avec Zod, validés à l'exécution et inférés par TypeScript.
 - **Compatible avec les modèles locaux.** Les appels d'outils sont reconnus même quand le modèle ne suit pas l'API `tool_calls` : balises Hermes/Qwen `<tool_call>`, marqueurs LFM, JSON nu, syntaxe pythonique. Les arguments `"42"` sont convertis en nombres quand le schéma l'exige.
 - **Prêt pour la production.** Retries avec backoff, timeouts, `AbortSignal`, budget en tokens et en dollars, guardrails, hooks, logs structurés, persistance de l'historique.
+- **Agent Skills.** Les dossiers `SKILL.md` au [format ouvert Agent Skills](https://agentskills.io) se branchent directement : le modèle ne voit que leur nom et leur description, et charge les instructions seulement quand la tâche le demande.
 - **Workflows durables.** Graphe d'étapes avec branches conditionnelles, étapes parallèles, retry par étape, trace d'exécution, checkpoints et reprise après échec.
 - **Léger.** Une dépendance d'exécution (`@modelcontextprotocol/sdk`), Zod en peer dependency, `fetch` natif, ESM.
 
@@ -45,7 +46,7 @@ console.log(await agent.run("Quel temps fait-il à Lyon ?"));
 
 - [Installation](#installation)
 - [Démarrage rapide](#démarrage-rapide)
-- [Concepts](#concepts) : [Agent](#agent) · [Outils](#outils) · [Sortie structurée](#sortie-structurée) · [Streaming](#streaming) · [Multimodal](#multimodal) · [MCP](#mcp) · [Skills](#skills) · [Multi-agents](#multi-agents)
+- [Concepts](#concepts) : [Agent](#agent) · [Outils](#outils) · [Sortie structurée](#sortie-structurée) · [Streaming](#streaming) · [Multimodal](#multimodal) · [MCP](#mcp) · [Toolkits](#toolkits) · [Agent Skills](#agent-skills) · [Multi-agents](#multi-agents)
 - [Workflows](#workflows)
 - [En production](#en-production) : [Hooks](#hooks) · [Approbation humaine](#approbation-humaine) · [Guardrails](#guardrails) · [Budget](#budget-et-consommation) · [Historique](#persistance-de-lhistorique) · [Fiabilité](#fiabilité-et-annulation) · [Logs](#logs)
 - [Référence API](#référence-api)
@@ -234,14 +235,14 @@ await agent.shutdown(); // ferme les connexions MCP
 
 Si deux serveurs exposent le même nom d'outil, celui du second est préfixé par le nom du serveur (`<serveur>_<outil>`).
 
-### Skills
+### Toolkits
 
-Un skill regroupe des outils, des instructions ajoutées au prompt système et des hooks `initialize` / `shutdown`. Les noms de ses outils sont préfixés par le nom du skill (`math_calculer`), sauf avec `prefixToolNames: false`.
+Un toolkit regroupe des outils, des instructions ajoutées au prompt système et des hooks `initialize` / `shutdown`. Les noms de ses outils sont préfixés par le nom du toolkit (`math_calculer`), sauf avec `prefixToolNames: false`.
 
 ```ts
-import { createSkill } from "@thegetget/get-agent";
+import { createToolkit } from "@thegetget/get-agent";
 
-const math = createSkill({
+const math = createToolkit({
   name: "math",
   description: "Calcul et conversions d'unités",
   tools: [calculer, convertir],
@@ -250,11 +251,64 @@ const math = createSkill({
   shutdown: async () => { /* libérer les ressources */ },
 });
 
-const agent = new Agent({ name: "assistant", skills: [math] });
+const agent = new Agent({ name: "assistant", toolkits: [math] });
 
-await agent.addSkill(autreSkill);   // ajout à chaud
-await agent.removeSkill("math");    // retrait à chaud (appelle shutdown)
+await agent.addToolkit(autreToolkit); // ajout à chaud
+await agent.removeToolkit("math");    // retrait à chaud (appelle shutdown)
 ```
+
+> [!NOTE]
+> Jusqu'à la version 1.1, les toolkits s'appelaient « skills » (`createSkill`, `skills`, `addSkill`…). Ces noms fonctionnent toujours mais sont dépréciés, et seront retirés en 2.0.
+
+### Agent Skills
+
+Une [Agent Skill](https://agentskills.io) est un dossier qui contient un fichier `SKILL.md` : un en-tête YAML (`name`, `description`) suivi d'instructions en Markdown, avec éventuellement des fichiers annexes (`references/`, `scripts/`, `assets/`).
+
+```
+skills/
+└── message-de-commit/
+    ├── SKILL.md
+    └── references/
+        └── exemples.md
+```
+
+```markdown
+---
+name: message-de-commit
+description: Rédige des messages de commit au format Conventional Commits. À utiliser dès qu'on demande un message de commit.
+---
+
+# Message de commit
+
+1. Identifie le type du changement : feat, fix, refactor, docs…
+2. Écris le sujet à l'impératif, en 72 caractères maximum.
+
+Consulte `references/exemples.md` avant de répondre.
+```
+
+Indiquez à l'agent le dossier des skills :
+
+```ts
+const agent = new Agent({
+  name: "assistant",
+  agentSkills: ["./skills"], // dossier de skills, dossier d'une skill, ou skills déjà chargées
+});
+
+await agent.run("J'ai ajouté la réinitialisation du mot de passe. Propose un message de commit.");
+```
+
+Le chargement est **progressif**, pour ne pas encombrer le contexte :
+
+1. **Au démarrage**, seuls le nom et la description de chaque skill sont ajoutés au prompt système.
+2. **Quand une tâche correspond à une skill**, le modèle appelle l'outil `load_skill` et reçoit les instructions de `SKILL.md` ainsi que la liste des fichiers annexes.
+3. **Si les instructions le demandent**, il lit un fichier annexe avec `read_skill_file`. Les chemins qui sortent du dossier de la skill sont refusés.
+
+Les en-têtes sont validés selon la spécification : `name` en minuscules, chiffres et tirets, identique au nom du dossier ; `description` obligatoire, 1 024 caractères au maximum. Les champs `license`, `compatibility`, `metadata` et `allowed-tools` sont lus et exposés sur l'objet `AgentSkill`.
+
+> [!IMPORTANT]
+> GetAgent **n'exécute jamais** les scripts fournis par une skill : `read_skill_file` ne fait que les lire. Si vos skills ont besoin d'exécuter du code, fournissez vous-même l'outil correspondant, de préférence avec `requiresApproval`.
+
+Pour composer votre propre mécanisme, les fonctions sous-jacentes sont exportées : `loadAgentSkills`, `loadAgentSkill`, `agentSkillsPrompt`, `createAgentSkillTools`, `readAgentSkillInstructions`, `listAgentSkillFiles`, `readAgentSkillFile`.
 
 ### Multi-agents
 
@@ -535,11 +589,12 @@ const agent = new Agent({
 | `model` | `string` | `""` | Nom du modèle envoyé à l'API. |
 | `baseUrl` | `string` | `"http://127.0.0.1:8080/v1"` | URL d'une API compatible OpenAI. |
 | `apiKey` | `string` | — | Clé envoyée en `Authorization: Bearer`. |
-| `systemPrompt` | `string` | `"You are a helpful AI assistant."` | Prompt système. Les prompts des skills y sont ajoutés. |
+| `systemPrompt` | `string` | `"You are a helpful AI assistant."` | Prompt système. Les prompts des toolkits et le catalogue des Agent Skills y sont ajoutés. |
 | `temperature` | `number` | `0.2` | Température d'échantillonnage. |
 | `maxIterations` | `number` | `10` | Nombre maximal de tours LLM ↔ outils par run. |
 | `tools` | `Tool[]` | `[]` | Outils locaux. |
-| `skills` | `Skill[]` | `[]` | Skills. |
+| `toolkits` | `Toolkit[]` | `[]` | Voir [Toolkits](#toolkits). `skills` reste accepté (déprécié). |
+| `agentSkills` | `Array<string \| AgentSkill>` | `[]` | Voir [Agent Skills](#agent-skills). |
 | `mcpServers` | `McpServerConfig[]` | `[]` | Serveurs MCP (stdio). |
 | `mcpStrict` | `boolean` | `false` | Fait échouer l'initialisation si un serveur MCP est injoignable. |
 | `parallelTools` | `boolean` | `false` | Exécute en parallèle les outils demandés dans un même tour. |
@@ -562,9 +617,9 @@ const agent = new Agent({
 | `runStream(input, options?)` | `AsyncGenerator<string>` du texte de la réponse. |
 | `runStreamStructured(input, config)` | `{ stream, result }` : texte diffusé, puis objet validé. |
 | `repl(options?)` | Session interactive dans le terminal (`/exit`, `/clear`, `/usage`, `/tools`, `/help`). |
-| `initialize()` / `shutdown()` | Connexion et libération des ressources (MCP, skills). `initialize()` est appelé automatiquement au premier run. |
-| `addSkill(skill)` / `removeSkill(name)` | Ajout et retrait de skills à chaud. |
-| `getRegisteredTools()` / `getRegisteredSkills()` | Outils et skills disponibles. |
+| `initialize()` / `shutdown()` | Connexion et libération des ressources (MCP, toolkits, Agent Skills). `initialize()` est appelé automatiquement au premier run. |
+| `addToolkit(toolkit)` / `removeToolkit(name)` | Ajout et retrait de toolkits à chaud. |
+| `getRegisteredTools()` / `getRegisteredToolkits()` / `getAgentSkills()` | Outils, toolkits et Agent Skills disponibles. |
 | `getHistory()` / `clearHistory()` | Lecture et réinitialisation de l'historique. |
 | `getUsage()` / `clearUsage()` | Consommation cumulée et coût estimé. |
 
@@ -589,12 +644,12 @@ const agent = new Agent({
 
 ## Exemples
 
-Le dossier [`examples/`](./examples) contient 15 scripts exécutables avec `npx tsx examples/<fichier>.ts` :
+Le dossier [`examples/`](./examples) contient 16 scripts exécutables avec `npx tsx examples/<fichier>.ts` :
 
 | Thème | Exemples |
 | --- | --- |
 | Bases | [chat et sortie structurée](./examples/01_chat_et_sortie_structuree.ts), [outils](./examples/02_outils.ts), [conversation](./examples/11_chat_conversation.ts), [multimodal](./examples/14_multimodal.ts) |
-| Extensions | [skills](./examples/03_skills.ts), [MCP](./examples/04_mcp.ts), [multi-agents](./examples/09_multi_agents.ts) |
+| Extensions | [toolkits](./examples/03_toolkits.ts), [Agent Skills](./examples/16_agent_skills.ts), [MCP](./examples/04_mcp.ts), [multi-agents](./examples/09_multi_agents.ts) |
 | Workflows | [graphe d'étapes](./examples/05_workflow.ts), [scoring](./examples/13_scoring_workflow.ts), [parallèle, checkpoints, reprise](./examples/15_workflow_avance.ts) |
 | Production | [streaming et REPL](./examples/06_streaming_et_repl.ts), [hooks](./examples/07_hooks.ts), [approbation humaine](./examples/08_human_in_the_loop.ts), [guardrails, budget, logs, persistance](./examples/10_production.ts), [LLM-as-judge](./examples/12_scoring_reponses.ts) |
 

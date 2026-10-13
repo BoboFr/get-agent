@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0
+
+### Ajouts
+- **Agent Skills** : prise en charge du [format ouvert Agent Skills](https://agentskills.io) (dossiers `SKILL.md`).
+  - Option `agentSkills` de l'agent : un dossier de skills, un dossier de skill, ou des skills déjà chargées.
+  - Chargement progressif : seuls le nom et la description vont dans le prompt système ; le modèle charge les instructions avec l'outil `load_skill` et lit les fichiers annexes avec `read_skill_file` (les chemins hors du dossier sont refusés).
+  - Validation des en-têtes selon la spécification (`name`, `description`, `license`, `compatibility`, `metadata`, `allowed-tools`).
+  - Fonctions exportées : `loadAgentSkills`, `loadAgentSkill`, `agentSkillsPrompt`, `createAgentSkillTools`, `readAgentSkillInstructions`, `listAgentSkillFiles`, `readAgentSkillFile`, et la méthode `agent.getAgentSkills()`.
+  - Les scripts fournis par une skill ne sont jamais exécutés.
+
+### Changements
+- `Skill` est renommé `Toolkit`, pour ne plus le confondre avec les Agent Skills : `createToolkit`, `ToolkitConfig`, option `toolkits`, méthodes `addToolkit`, `removeToolkit` et `getRegisteredToolkits`.
+- Les anciens noms (`Skill`, `createSkill`, `SkillConfig`, option `skills`, `addSkill`, `removeSkill`, `getRegisteredSkills`) restent disponibles mais sont dépréciés, et seront retirés en 2.0.
+
 ## 1.1.0
 
 ### Ajouts
